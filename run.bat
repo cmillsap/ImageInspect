@@ -1,3 +1,3 @@
 @echo off
-call "%~dp0venv\Scriptsctivate"
-python "%~dp0app.py"
+"%~dp0venv\Scripts\python.exe" "%~dp0app.py"
+if errorlevel 1 pause
