@@ -2,13 +2,19 @@
 CLIP Search
 
 Indexes a folder of images with OpenAI's CLIP ViT-B/32 and ranks them
-against a text prompt. Both halves of the model run through onnxruntime,
-from the same pinned HuggingFace checkpoint ImageMosaic uses, so the image
-and text embeddings share one space.
+against a text prompt, guide images, or both. Both halves of the model run
+through onnxruntime, from the same pinned HuggingFace checkpoint ImageMosaic
+uses, so the image and text embeddings share one space.
 
 Each image's embedding and a small JPEG thumbnail are cached in SQLite,
 keyed on path and modification time, so only new or edited files are
-decoded on later searches.
+decoded on later searches. Files that fail to decode are remembered too, so
+a corrupt photo is not retried on every search, only once it changes.
+
+A query is any mix of a text prompt and guide images. Guide embeddings are
+averaged into one direction; text and image scores are combined after
+standardising each across the index, since image-to-image similarities sit
+far higher than text-to-image ones and would otherwise drown the text out.
 """
 
 import hashlib
@@ -132,6 +138,10 @@ class Clip:
         name = self._vision.get_inputs()[0].name
         return _normalize(self._vision.run(None, {name: batch})[0])
 
+    def embed_image_file(self, path: str) -> np.ndarray:
+        with open_image(path, draft_size=(2 * CLIP_SIZE, 2 * CLIP_SIZE)) as img:
+            return self.embed_images([clip_input(img)])[0]
+
     def embed_text(self, text: str) -> np.ndarray:
         ids = np.array([self._tokenizer.encode(text).ids], np.int64)
         return _normalize(self._text.run(None, {"input_ids": ids})[0])[0]
@@ -190,7 +200,11 @@ def _prepare(path: str) -> Optional[Tuple[np.ndarray, bytes]]:
 # ----------------------------------------------------------------------
 
 class Index:
-    """Embeddings for a set of image files, backed by the SQLite cache."""
+    """Embeddings for a set of image files, backed by the SQLite cache.
+
+    The cache is read into memory once, so repeat searches only need to
+    stat the folder rather than reload every embedding.
+    """
 
     def __init__(self, cache_path: str = CACHE_PATH):
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
@@ -198,12 +212,28 @@ class Index:
         self._db.execute(
             "CREATE TABLE IF NOT EXISTS images (path TEXT PRIMARY KEY, "
             "mtime REAL NOT NULL, embedding BLOB NOT NULL, thumb BLOB NOT NULL)")
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS failed (path TEXT PRIMARY KEY, "
+            "mtime REAL NOT NULL)")
+        self._known: Optional[dict] = None     # path -> (mtime, embedding)
+        self._failed: dict = {}                # path -> mtime
         self.paths: List[str] = []
         self.embeddings = np.zeros((0, 512), np.float32)
 
+    def _load(self, progress: Progress) -> None:
+        if self._known is not None:
+            return
+        if progress:
+            progress("Loading index", 0, 0)
+        self._known = {path: (mtime, np.frombuffer(blob, np.float32))
+                       for path, mtime, blob in self._db.execute(
+                           "SELECT path, mtime, embedding FROM images")}
+        self._failed = dict(self._db.execute("SELECT path, mtime FROM failed"))
+
     def build(self, clip: Clip, paths: List[str], progress: Progress = None,
               should_cancel: Callable[[], bool] = lambda: False) -> None:
-        """Load cached embeddings for paths and compute the missing ones."""
+        """Use cached embeddings for paths and compute the missing ones."""
+        self._load(progress)
         mtimes = {}
         for p in paths:
             try:
@@ -211,44 +241,93 @@ class Index:
             except OSError:
                 pass
 
-        cached = {}
-        for path, mtime, blob in self._db.execute(
-                "SELECT path, mtime, embedding FROM images"):
-            if mtimes.get(path) == mtime:
-                cached[path] = np.frombuffer(blob, np.float32)
+        current = {}
+        missing = []
+        for path, mtime in mtimes.items():
+            known = self._known.get(path)
+            if known is not None and known[0] == mtime:
+                current[path] = known[1]
+            elif self._failed.get(path) != mtime:
+                missing.append(path)
 
-        missing = [p for p in mtimes if p not in cached]
+        done = 0
         with ThreadPoolExecutor() as pool:
             for start in range(0, len(missing), BATCH_SIZE):
                 if should_cancel():
                     break
-                if progress:
-                    progress("Indexing images", start, len(missing))
                 chunk = missing[start:start + BATCH_SIZE]
-                prepared = [(p, r) for p, r in zip(chunk, pool.map(_prepare, chunk))
-                            if r is not None]
-                if not prepared:
-                    continue
-                vectors = clip.embed_images([r[0] for _, r in prepared])
+                prepared, failed = [], []
+                # Report each file as it finishes: a batch can take minutes
+                # when files have to come down from cloud storage first.
+                for path, result in zip(chunk, pool.map(_prepare, chunk)):
+                    done += 1
+                    if progress:
+                        progress(f"Indexing new images ({os.path.basename(path)})",
+                                 done, len(missing))
+                    if result is None:
+                        failed.append((path, mtimes[path]))
+                    else:
+                        prepared.append((path, result))
                 rows = []
-                for (path, (_, thumb)), vector in zip(prepared, vectors):
-                    cached[path] = vector
-                    rows.append((path, mtimes[path], vector.tobytes(), thumb))
+                if prepared:
+                    vectors = clip.embed_images([r[0] for _, r in prepared])
+                    for (path, (_, thumb)), vector in zip(prepared, vectors):
+                        current[path] = vector
+                        self._known[path] = (mtimes[path], vector)
+                        rows.append((path, mtimes[path], vector.tobytes(), thumb))
+                self._failed.update(failed)
                 with self._db:
                     self._db.executemany(
                         "INSERT OR REPLACE INTO images VALUES (?, ?, ?, ?)", rows)
+                    self._db.executemany(
+                        "INSERT OR REPLACE INTO failed VALUES (?, ?)", failed)
 
-        self.paths = list(cached)
-        self.embeddings = (np.stack(list(cached.values())) if cached
+        self.paths = list(current)
+        self.embeddings = (np.stack(list(current.values())) if current
                            else np.zeros((0, 512), np.float32))
 
-    def search(self, query: np.ndarray, limit: int) -> List[Tuple[str, float]]:
-        """The limit best (path, cosine similarity) matches, best first."""
-        scores = self.embeddings @ query
-        best = np.argsort(-scores)[:limit]
-        return [(self.paths[i], float(scores[i])) for i in best]
+    def embedding(self, path: str) -> Optional[np.ndarray]:
+        """The cached embedding of path, if it is up to date."""
+        path = os.path.abspath(path)
+        known = (self._known or {}).get(path)
+        try:
+            if known is not None and known[0] == os.path.getmtime(path):
+                return known[1]
+        except OSError:
+            pass
+        return None
+
+    def search(self, text: Optional[np.ndarray], guides: Optional[np.ndarray],
+               image_weight: float, limit: int) -> List[Tuple[str, dict]]:
+        """The limit best matches, best first, as (path, scores).
+
+        text is a text embedding and guides a stack of guide-image
+        embeddings; either may be None. scores holds the cosine similarity
+        to each part of the query present, under "text" and "image".
+        image_weight (0-1) sets how much the image part counts when both
+        are given.
+        """
+        parts = {}
+        if text is not None:
+            parts["text"] = self.embeddings @ text
+        if guides is not None and len(guides):
+            parts["image"] = self.embeddings @ _normalize(guides.mean(axis=0))
+        if not parts or not len(self.paths):
+            return []
+        if len(parts) == 1:
+            rank = next(iter(parts.values()))
+        else:
+            rank = (image_weight * _standardize(parts["image"])
+                    + (1 - image_weight) * _standardize(parts["text"]))
+        best = np.argsort(-rank)[:limit]
+        return [(self.paths[i], {k: float(v[i]) for k, v in parts.items()})
+                for i in best]
 
     def thumbnail(self, path: str) -> Optional[bytes]:
         row = self._db.execute("SELECT thumb FROM images WHERE path = ?",
                                (path,)).fetchone()
         return row[0] if row else None
+
+
+def _standardize(scores: np.ndarray) -> np.ndarray:
+    return (scores - scores.mean()) / (scores.std() or 1.0)
