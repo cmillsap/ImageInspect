@@ -15,20 +15,22 @@ A query is any mix of a text prompt and guide images. Guide embeddings are
 averaged into one direction; text and image scores are combined after
 standardising each across the index, since image-to-image similarities sit
 far higher than text-to-image ones and would otherwise drown the text out.
+For a person search, face_search supplies per-image face scores that take
+the place of the guide-image part.
 """
 
-import hashlib
 import io
 import os
 import sqlite3
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
 
+import models
 from image_io import open_image
+from models import ModelFile, Progress
 
 # Same formats as ImageMosaic (tile_database.DEFAULT_IMAGE_EXTENSIONS).
 IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tif', '.tiff',
@@ -37,26 +39,25 @@ IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tif', '.tiff',
 _BASE_URL = ("https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/"
              "d15189d7028b43f1d3e65039190477f6af591c2a/")
 
-# (local filename, url, sha256 or None, size). The vision model is the very
-# file ImageMosaic downloads, so an existing copy of it is reused.
-VISION_MODEL = ("clip-vit-b32-vision-fp16.onnx",
-                _BASE_URL + "onnx/vision_model_fp16.onnx",
-                "35c4e0fb0aeee527dcde1693520b214a34424a786babd530f35366bad5844efd",
-                176080659)
-TEXT_MODEL = ("clip-vit-b32-text-fp16.onnx",
-              _BASE_URL + "onnx/text_model_fp16.onnx",
-              "df587ffbf248bf20d44fa6e16adc5ebc27ead691860e5333dbdaab5fd6bf3f6e",
-              127339794)
-TOKENIZER = ("clip-vit-b32-tokenizer.json", _BASE_URL + "tokenizer.json",
-             None, 2224119)
-
-APP_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-                       "ImageInspect")
-MODEL_DIR = os.path.join(APP_DIR, "models")
+APP_DIR = models.APP_DIR
+CACHE_PATH = os.path.join(APP_DIR, "index.sqlite")
 IMAGEMOSAIC_MODEL_DIR = os.path.join(
     os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
     "ImageMosaic", "models")
-CACHE_PATH = os.path.join(APP_DIR, "index.sqlite")
+
+# The vision model is the very file ImageMosaic downloads, so an existing
+# copy of it is reused.
+VISION_MODEL = ModelFile(
+    "clip-vit-b32-vision-fp16.onnx", _BASE_URL + "onnx/vision_model_fp16.onnx",
+    "35c4e0fb0aeee527dcde1693520b214a34424a786babd530f35366bad5844efd",
+    176080659,
+    os.path.join(IMAGEMOSAIC_MODEL_DIR, "clip-vit-b32-vision-fp16.onnx"))
+TEXT_MODEL = ModelFile(
+    "clip-vit-b32-text-fp16.onnx", _BASE_URL + "onnx/text_model_fp16.onnx",
+    "df587ffbf248bf20d44fa6e16adc5ebc27ead691860e5333dbdaab5fd6bf3f6e",
+    127339794)
+TOKENIZER = ModelFile("clip-vit-b32-tokenizer.json",
+                      _BASE_URL + "tokenizer.json", None, 2224119)
 
 CLIP_SIZE = 224
 CLIP_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], np.float32)
@@ -66,69 +67,25 @@ CLIP_MAX_TOKENS = 77
 THUMB_SIZE = 256
 BATCH_SIZE = 32
 
-Progress = Optional[Callable[[str, int, int], None]]
-
 
 # ----------------------------------------------------------------------
 # Models
 # ----------------------------------------------------------------------
 
-def _model_file(spec) -> str:
-    """Where a model file is, or will be once downloaded."""
-    name, _, _, size = spec
-    if spec is VISION_MODEL:
-        shared = os.path.join(IMAGEMOSAIC_MODEL_DIR, name)
-        if os.path.isfile(shared) and os.path.getsize(shared) == size:
-            return shared
-    return os.path.join(MODEL_DIR, name)
-
-
-def _download(spec, progress: Progress) -> None:
-    name, url, sha256, _ = spec
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    final_path = os.path.join(MODEL_DIR, name)
-    part_path = final_path + ".part"
-    digest = hashlib.sha256()
-    try:
-        with urllib.request.urlopen(url, timeout=60) as response, \
-                open(part_path, "wb") as out:
-            total = int(response.headers.get("Content-Length") or 0)
-            done = 0
-            while chunk := response.read(1 << 20):
-                out.write(chunk)
-                digest.update(chunk)
-                done += len(chunk)
-                if progress:
-                    progress(f"Downloading {name}", done, total)
-        if sha256 and digest.hexdigest() != sha256:
-            raise ValueError(f"Downloaded {name} is corrupt; please retry.")
-        os.replace(part_path, final_path)
-    finally:
-        if os.path.exists(part_path):
-            os.remove(part_path)
-
-
 def ensure_models(progress: Progress = None) -> None:
     """Download whichever model files are missing."""
-    for spec in (VISION_MODEL, TEXT_MODEL, TOKENIZER):
-        path = _model_file(spec)
-        if not (os.path.isfile(path) and os.path.getsize(path) == spec[3]):
-            _download(spec, progress)
+    models.ensure_models((VISION_MODEL, TEXT_MODEL, TOKENIZER), progress)
 
 
 class Clip:
     """The CLIP image and text encoders. Embeddings are unit length."""
 
     def __init__(self):
-        import onnxruntime
         from tokenizers import Tokenizer
 
-        providers = ["CPUExecutionProvider"]
-        self._vision = onnxruntime.InferenceSession(
-            _model_file(VISION_MODEL), providers=providers)
-        self._text = onnxruntime.InferenceSession(
-            _model_file(TEXT_MODEL), providers=providers)
-        self._tokenizer = Tokenizer.from_file(_model_file(TOKENIZER))
+        self._vision = models.create_session(VISION_MODEL)
+        self._text = models.create_session(TEXT_MODEL)
+        self._tokenizer = Tokenizer.from_file(models.model_path(TOKENIZER))
         self._tokenizer.enable_truncation(CLIP_MAX_TOKENS)
 
     def embed_images(self, images: List[np.ndarray]) -> np.ndarray:
@@ -298,30 +255,41 @@ class Index:
         return None
 
     def search(self, text: Optional[np.ndarray], guides: Optional[np.ndarray],
-               image_weight: float, limit: int) -> List[Tuple[str, dict]]:
+               image_weight: float, limit: int,
+               person: Optional[np.ndarray] = None,
+               person_threshold: float = 0.0) -> List[Tuple[str, dict]]:
         """The limit best matches, best first, as (path, scores).
 
         text is a text embedding and guides a stack of guide-image
-        embeddings; either may be None. scores holds the cosine similarity
-        to each part of the query present, under "text" and "image".
-        image_weight (0-1) sets how much the image part counts when both
-        are given.
+        embeddings; either may be None. person, if given, takes the place
+        of guides: each path's similarity to the person being searched for
+        (see face_search.FaceIndex.person_scores), in the order of
+        self.paths, and only paths scoring at least person_threshold are
+        returned. scores holds the similarity to each part of the query
+        present, under "text", "image" and "person". image_weight (0-1)
+        sets how much the image or person part counts when text is given
+        too.
         """
         parts = {}
         if text is not None:
             parts["text"] = self.embeddings @ text
-        if guides is not None and len(guides):
+        if person is not None:
+            parts["person"] = person
+        elif guides is not None and len(guides):
             parts["image"] = self.embeddings @ _normalize(guides.mean(axis=0))
         if not parts or not len(self.paths):
             return []
         if len(parts) == 1:
             rank = next(iter(parts.values()))
         else:
-            rank = (image_weight * _standardize(parts["image"])
+            visual = parts.get("image", parts.get("person"))
+            rank = (image_weight * _standardize(visual)
                     + (1 - image_weight) * _standardize(parts["text"]))
-        best = np.argsort(-rank)[:limit]
+        best = np.argsort(-rank)
+        if person is not None:
+            best = best[person[best] >= person_threshold]
         return [(self.paths[i], {k: float(v[i]) for k, v in parts.items()})
-                for i in best]
+                for i in best[:limit]]
 
     def thumbnail(self, path: str) -> Optional[bytes]:
         row = self._db.execute("SELECT thumb FROM images WHERE path = ?",

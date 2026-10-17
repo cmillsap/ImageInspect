@@ -9,3 +9,5 @@ numpy==2.5.4
 onnxruntime==1.31.0
 # CLIP's text tokenizer
 tokenizers==0.23.3
+# Tests: venv\Scripts\python -m pytest
+pytest==8.4.2

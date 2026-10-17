@@ -3,6 +3,7 @@ Image Inspect
 
 Pick a folder, then describe what you are looking for, add guide images
 that look like it, or both, and see the images CLIP thinks match best.
+Guide images can instead pick out a person, matched by face recognition.
 Click a thumbnail to enlarge it; right-click it to search for similar ones.
 """
 
@@ -11,22 +12,35 @@ import sys
 
 import numpy as np
 from PIL import Image
-from PyQt6.QtCore import (QElapsedTimer, QSettings, QSize, Qt, QThread,
-                          QTimer, QUrl, pyqtSignal)
-from PyQt6.QtGui import (QColor, QDesktopServices, QIcon, QImage, QPainter,
+from PyQt6.QtCore import (QElapsedTimer, QEvent, QPoint, QSettings, QSize,
+                          Qt, QThread, QTimer, QUrl, pyqtSignal)
+from PyQt6.QtGui import (QAction, QColor, QContextMenuEvent, QDesktopServices,
+                         QIcon, QImage, QKeySequence, QPainter, QPalette,
                          QPixmap)
-from PyQt6.QtWidgets import (QApplication, QCheckBox, QDialog, QFileDialog,
+from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
+                             QDialog, QFileDialog, QFrame, QGridLayout,
                              QHBoxLayout, QLabel, QLineEdit, QListWidget,
                              QListWidgetItem, QMainWindow, QMenu, QMessageBox,
-                             QProgressBar, QPushButton, QSlider, QSpinBox,
-                             QVBoxLayout, QWidget)
+                             QProgressBar, QPushButton, QRadioButton,
+                             QScrollArea, QSlider, QSpacerItem, QSpinBox,
+                             QStyle, QToolButton, QVBoxLayout, QWidget)
 
 import clip_search
+import face_search
 from image_io import open_image
+from ui_support import (THEME_CHANGE, HintLabel, StatusLabel, WidestTextLabel,
+                        WrapLabel, announce, apply_windows_appearance,
+                        initial_window_rect, make_secondary,
+                        refresh_scaled_fonts, scale_font,
+                        secondary_text_color, set_tone)
 
 ICON_SIZE = clip_search.THUMB_SIZE * 3 // 4
 GUIDE_ICON_SIZE = 64
-GUIDE_COLOR = QColor(255, 190, 40, 90)
+# Drawn over photos, so the same in light and dark themes.
+FACE_BOX_COLOR = QColor(255, 190, 40)
+
+# What the guide images are matched on.
+MATCH_LOOK, MATCH_PERSON = "look", "person"
 
 
 def same_path(a, b):
@@ -62,20 +76,35 @@ def load_pixmap(path, max_size):
     return QPixmap.fromImage(qimage)
 
 
+def path_key(path):
+    return os.path.normcase(os.path.abspath(path))
+
+
 class SearchWorker(QThread):
-    """Downloads models if needed, indexes the folder, then ranks it."""
+    """Downloads models if needed, indexes the folder, then ranks it.
+
+    For a person search, the guide images' faces are found first. Guides
+    whose face is not yet known are reported through guide_faces; if any
+    shows several people the search stops there, with needs_choice set, so
+    the window can ask which one is meant and search again.
+    """
 
     progress = pyqtSignal(str, int, int)
-    finished_ok = pyqtSignal(list)      # [(path, scores, thumbnail bytes)]
+    finished_ok = pyqtSignal(list)      # [(path, scores, thumbnail, face box)]
     failed = pyqtSignal(str)
+    guide_faces = pyqtSignal(list)      # [(path, [face_search.Face])]
 
     def __init__(self, state, folder, recursive, prompt, guides, image_weight,
-                 limit):
+                 limit, match=MATCH_LOOK, known_faces=None, threshold=0.0):
         super().__init__()
-        self.state = state              # dict holding the Clip and Index
+        self.state = state              # dict holding the models and indexes
         self.folder, self.recursive = folder, recursive
         self.prompt, self.guides = prompt, guides
         self.image_weight, self.limit = image_weight, limit
+        self.match, self.threshold = match, threshold
+        # path_key -> face embedding, or None for a guide with no face
+        self.known_faces = dict(known_faces or {})
+        self.needs_choice = False
 
     def run(self):
         try:
@@ -86,57 +115,221 @@ class SearchWorker(QThread):
                 self.state["index"] = clip_search.Index()
             clip, index = self.state["clip"], self.state["index"]
 
+            template = None
+            if self.match == MATCH_PERSON:
+                template = self.person_template()
+                if template is None:
+                    return
+
             self.progress.emit("Scanning folder", 0, 0)
             paths = clip_search.find_images(self.folder, self.recursive)
             index.build(clip, paths, self.progress.emit,
                         self.isInterruptionRequested)
 
-            self.progress.emit("Ranking images", 0, 0)
             text = clip.embed_text(self.prompt) if self.prompt else None
+            if template is not None:
+                face_index = self.state["face_index"]
+                face_index.build(self.state["faces"], paths, self.progress.emit,
+                                 self.isInterruptionRequested)
+                self.progress.emit("Ranking images", 0, 0)
+                results = index.search(
+                    text, None, self.image_weight, self.limit,
+                    person=face_index.person_scores(template, index.paths),
+                    person_threshold=self.threshold)
+                self.finished_ok.emit([
+                    (path, scores, index.thumbnail(path),
+                     face_index.best_box(template, path))
+                    for path, scores in results])
+                return
+
+            self.progress.emit("Ranking images", 0, 0)
             guides = None
             if self.guides:
                 guides = np.stack([
                     v if (v := index.embedding(p)) is not None
                     else clip.embed_image_file(p) for p in self.guides])
             results = index.search(text, guides, self.image_weight, self.limit)
-            self.finished_ok.emit([(path, scores, index.thumbnail(path))
+            self.finished_ok.emit([(path, scores, index.thumbnail(path), None)
                                    for path, scores in results])
         except Exception as e:                               # noqa: BLE001
             self.failed.emit(str(e))
 
+    def person_template(self):
+        """The face embedding to search for, or None to stop here."""
+        if "faces" not in self.state:
+            face_search.ensure_models(self.progress.emit)
+            self.progress.emit("Loading face recognition model", 0, 0)
+            self.state["faces"] = face_search.FaceModel()
+            self.state["face_index"] = face_search.FaceIndex()
+        model = self.state["faces"]
+
+        found = []
+        for path in self.guides:
+            if path_key(path) not in self.known_faces:
+                self.progress.emit(f"Finding faces in {os.path.basename(path)}", 0, 0)
+                faces = model.analyze_file(path, crops=True)
+                found.append((path, faces))
+                if len(faces) == 1:
+                    self.known_faces[path_key(path)] = faces[0].embedding
+                elif not faces:
+                    self.known_faces[path_key(path)] = None
+        if found:
+            self.guide_faces.emit(found)
+        if any(len(faces) > 1 for _, faces in found):
+            self.needs_choice = True
+            return None
+
+        embeddings = [e for p in self.guides
+                      if (e := self.known_faces.get(path_key(p))) is not None]
+        if not embeddings:
+            self.failed.emit("No face was found in the guide images. "
+                             "Use photos where the person's face is clearly "
+                             "visible, or search for Things & scenes instead.")
+            return None
+        return face_search.person_template(np.stack(embeddings))
+
+
+def pixmap_from_bytes(data):
+    pixmap = QPixmap()
+    if data:
+        pixmap.loadFromData(data)
+    return pixmap
+
+
+def describe_place(box):
+    """Where box (fractions of the image) sits, in words: "top left",
+    "centre", "bottom"."""
+    x = (box[0] + box[2]) / 2
+    y = (box[1] + box[3]) / 2
+    row = "top" if y < 1 / 3 else "bottom" if y > 2 / 3 else ""
+    column = "left" if x < 1 / 3 else "right" if x > 2 / 3 else ""
+    return " ".join(p for p in (row, column) if p) or "centre"
+
+
+def label_for(widget, text, name=None):
+    """A visible label for widget, which screen readers also hear as its
+    name, and whose Alt access key moves to it."""
+    label = QLabel(text)
+    label.setBuddy(widget)
+    widget.setAccessibleName(name or text.replace("&", ""))
+    return label
+
+
+def heading(text, buddy=None, name=None):
+    """A bold section label, sized from the window font so it follows
+    later font changes; with buddy, also that input's spoken name."""
+    label = label_for(buddy, text, name) if buddy is not None else QLabel(text)
+    scale_font(label, 1.0, bold=True)
+    return label
+
+
+class ThumbnailList(QListWidget):
+    """An icon grid whose context menu opens on the current item when
+    asked for from the keyboard (Menu key or Shift+F10), and that shows a
+    hint while empty. The hint is also its accessible description, since
+    screen readers cannot see painted text."""
+
+    menu_requested = pyqtSignal(object, QPoint)   # item or None, global pos
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.hint = ""
+        self.setViewMode(QListWidget.ViewMode.IconMode)
+        self.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.setMovement(QListWidget.Movement.Static)
+
+    def set_hint(self, hint):
+        self.hint = hint
+        self.setAccessibleDescription(hint)
+        self.viewport().update()
+
+    def contextMenuEvent(self, event):
+        if event.reason() == QContextMenuEvent.Reason.Keyboard:
+            item = self.currentItem()
+            rect = self.visualItemRect(item) if item else self.viewport().rect()
+            self.menu_requested.emit(item, self.viewport().mapToGlobal(rect.center()))
+        else:
+            self.menu_requested.emit(self.itemAt(event.pos()), event.globalPos())
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.count() == 0 and self.hint:
+            painter = QPainter(self.viewport())
+            painter.setPen(secondary_text_color(self.palette()))
+            margin = self.fontMetrics().averageCharWidth() * 2
+            painter.drawText(self.viewport().rect().adjusted(margin, 0, -margin, 0),
+                             Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+                             self.hint)
+            painter.end()
+
+
+def with_badge(pixmap, icon):
+    """pixmap with icon drawn small in its bottom-right corner."""
+    pixmap = QPixmap(pixmap)
+    side = pixmap.width() // 3
+    painter = QPainter(pixmap)
+    painter.drawPixmap(pixmap.width() - side, pixmap.height() - side,
+                       icon.pixmap(side, side))
+    painter.end()
+    return pixmap
+
 
 class ImageDialog(QDialog):
-    """One image, scaled to fit the screen."""
+    """One image, scaled to fit the screen, with the matched face boxed."""
 
-    def __init__(self, path, parent=None, on_find_similar=None):
+    def __init__(self, path, parent=None, on_find_similar=None,
+                 on_find_person=None, face_box=None):
         super().__init__(parent)
         self.setWindowTitle(path)
         self.path = path
 
         screen = self.screen().availableGeometry()
         max_size = (int(screen.width() * 0.9), int(screen.height() * 0.85))
-        label = QLabel()
-        label.setPixmap(load_pixmap(path, max_size))
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pixmap = load_pixmap(path, max_size)
+        if face_box is not None:
+            x1, y1, x2, y2 = face_box
+            w, h = pixmap.width(), pixmap.height()
+            painter = QPainter(pixmap)
+            pen = painter.pen()
+            pen.setColor(FACE_BOX_COLOR)
+            pen.setWidth(3)
+            painter.setPen(pen)
+            painter.drawRect(round(x1 * w), round(y1 * h),
+                             round((x2 - x1) * w), round((y2 - y1) * h))
+            painter.end()
+        self.image = QLabel()
+        self.image.setPixmap(pixmap)
+        self.image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image.setAccessibleName(f"Photo {os.path.basename(path)}")
+        if face_box is not None:
+            self.image.setAccessibleDescription(
+                f"The matching face is boxed, at the {describe_place(face_box)}")
 
-        open_button = QPushButton("Open in default viewer")
+        open_button = QPushButton("&Open in default viewer")
         open_button.clicked.connect(lambda: QDesktopServices.openUrl(
             QUrl.fromLocalFile(self.path)))
-        folder_button = QPushButton("Show in folder")
+        folder_button = QPushButton("Show in &folder")
         folder_button.clicked.connect(self.show_in_folder)
 
+        path_label = QLabel(path)
+        path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         buttons = QHBoxLayout()
-        buttons.addWidget(QLabel(path), 1)
+        buttons.addWidget(path_label, 1)
         if on_find_similar is not None:
-            similar_button = QPushButton("Find similar images")
+            similar_button = QPushButton("Find &similar images")
             similar_button.clicked.connect(lambda: (self.accept(),
                                                     on_find_similar(self.path)))
             buttons.addWidget(similar_button)
+        if on_find_person is not None:
+            person_button = QPushButton("Find this &person")
+            person_button.clicked.connect(lambda: (self.accept(),
+                                                   on_find_person(self.path)))
+            buttons.addWidget(person_button)
         buttons.addWidget(folder_button)
         buttons.addWidget(open_button)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(label, 1)
+        layout.addWidget(self.image, 1)
         layout.addLayout(buttons)
 
     def show_in_folder(self):
@@ -147,121 +340,374 @@ class ImageDialog(QDialog):
             QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(self.path)))
 
 
+class FacePickerDialog(QDialog):
+    """Asks which of the people in a guide image is meant.
+
+    The faces are shown left to right as they stand in the photo, and each
+    is named for screen readers by its place in it.
+    """
+
+    COLUMNS = 6
+
+    def __init__(self, path, faces, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Which person?")
+        self.choice = None
+        order = sorted(range(len(faces)),
+                       key=lambda i: (faces[i].box[0] + faces[i].box[2]) / 2)
+        biggest = max(range(len(faces)), key=lambda i: (
+            (faces[i].box[2] - faces[i].box[0]) * (faces[i].box[3] - faces[i].box[1])))
+        grid = QGridLayout()
+        self.buttons = []
+        for n, i in enumerate(order):
+            face = faces[i]
+            button = QToolButton()
+            button.setIcon(QIcon(pixmap_from_bytes(face.crop)))
+            button.setIconSize(QSize(face_search.CROP_SIZE, face_search.CROP_SIZE))
+            button.setAutoRaise(True)
+            button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            name = (f"Person {n + 1} of {len(faces)}, "
+                    f"{describe_place(face.box)}"
+                    + (", largest face" if i == biggest else ""))
+            button.setAccessibleName(name)
+            button.setToolTip(name)
+            button.clicked.connect(lambda _, i=i: self.choose(i))
+            grid.addWidget(button, n // self.COLUMNS, n % self.COLUMNS)
+            self.buttons.append(button)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(cancel)
+        layout = QVBoxLayout(self)
+        layout.addWidget(WrapLabel(
+            f"{os.path.basename(path)} shows {len(faces)} people. Choose the "
+            "one to search for; they are in order from left to right."))
+        layout.addLayout(grid)
+        layout.addLayout(buttons)
+        self.buttons[order.index(biggest)].setFocus()
+
+    def choose(self, i):
+        self.choice = i
+        self.accept()
+
+
+# Window-wide keys for the main actions. Each presses its button, so a key
+# does nothing a click could not.
+SHORTCUTS = {
+    "choose_folder": ["Ctrl+O"],
+    "add_guides": ["Ctrl+Shift+O"],
+    "search": ["Ctrl+Return", "Ctrl+Enter"],
+    "cancel": ["Esc"],
+}
+
+# How often indexing progress is spoken, in milliseconds.
+ANNOUNCE_PROGRESS_EVERY = 15000
+
+
 class MainWindow(QMainWindow):
-    def __init__(self):
+    """A fixed sidebar holding the query, the results grid beside it, and
+    progress in the status bar.
+
+    Colours come from the palette and sizes from the font, so the window
+    follows the Windows light/dark theme and text size. Every control has
+    a spoken name and is reachable from the keyboard, and what happens
+    away from the focus (results arriving, progress, cancelling) is
+    announced to screen readers.
+    """
+
+    RECENT_FOLDERS = 10
+
+    def __init__(self, settings=None):
         super().__init__()
         self.setWindowTitle("Image Inspect")
-        self.resize(1200, 800)
         self.setAcceptDrops(True)
-        self.settings = QSettings("ImageInspect", "ImageInspect")
+        self.settings = settings or QSettings("ImageInspect", "ImageInspect")
         self.state = {}
         self.worker = None
         self.clock = QElapsedTimer()
         self.ticker = QTimer(self)
         self.ticker.setInterval(250)
         self.ticker.timeout.connect(self.update_elapsed)
-        self.progress_text = self.query_text = self.result_text = ""
+        self.progress_text = ""
+        self.last_spoken = 0                # clock time progress was announced
+        self.enlarging = False
+        # path_key -> (face embedding, face crop pixmap), or (None, None) for
+        # a guide image with no face; filled in by person searches.
+        self.guide_faces = {}
+        self.pending_choices = []           # [(path, faces)] to ask about
 
-        self.folder_edit = QLineEdit(self.settings.value("folder", ""))
-        self.folder_edit.setPlaceholderText("Folder of images")
-        self.browse_button = QPushButton("Browse…")
+        # Folder
+        self.folder = QComboBox()
+        self.folder.setEditable(True)
+        self.folder.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.folder.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.folder.setMinimumContentsLength(10)
+        self.folder.lineEdit().setPlaceholderText("Folder of images")
+        self.folder.addItems(self.recent_folders())
+        self.folder.setCurrentText(self.settings.value("folder", ""))
+        self.folder.lineEdit().returnPressed.connect(self.search)
+        self.folder.setToolTip("The folder to search; recent folders are in the list")
+        folder_heading = heading("&Folder", self.folder, "Folder to search")
+        self.browse_button = QToolButton()
+        self.browse_button.setText("…")
+        self.browse_button.setAccessibleName("Choose folder")
+        self.browse_button.setToolTip("Choose a folder")
         self.browse_button.clicked.connect(self.choose_folder)
-        self.recursive = QCheckBox("Include subfolders")
+        self.recursive = QCheckBox("Include s&ubfolders")
         self.recursive.setChecked(self.settings.value("recursive", True, bool))
 
+        # Mode. Radio buttons rather than a segmented switch of push
+        # buttons: the windows11 style draws a checked push button's text
+        # unreadably in dark mode.
+        self.look_button = QRadioButton("&Things && scenes")
+        self.person_button = QRadioButton("&Person")
+        self.look_button.setToolTip("Find images that look like the description "
+                                    "and guide images (CLIP)")
+        self.person_button.setToolTip("Find photos of the person in the guide "
+                                      "photos (face recognition)")
+        self.mode = QButtonGroup(self)
+        for button in (self.look_button, self.person_button):
+            self.mode.addButton(button)
+        (self.person_button if self.settings.value("match") == MATCH_PERSON
+         else self.look_button).setChecked(True)
+        self.mode.buttonToggled.connect(self.update_controls)
+
+        # Description
         self.prompt_edit = QLineEdit()
-        self.prompt_edit.setPlaceholderText(
-            "Describe what you are looking for, e.g. \"a dog on the beach\" "
-            "(optional when using guide images)")
         self.prompt_edit.setClearButtonEnabled(True)
         self.prompt_edit.returnPressed.connect(self.search)
         self.prompt_edit.textChanged.connect(self.update_controls)
-        self.add_guide_button = QPushButton("Add guide images…")
-        self.add_guide_button.clicked.connect(self.choose_guides)
-        self.limit = QSpinBox()
-        self.limit.setRange(1, 1000)
-        self.limit.setValue(100)
-        self.limit.setPrefix("Top ")
-        self.search_button = QPushButton("Search")
-        self.search_button.clicked.connect(self.search_or_cancel)
+        prompt_heading = heading("&Description", self.prompt_edit)
 
-        self.guide_list = QListWidget()
-        self.guide_list.setViewMode(QListWidget.ViewMode.IconMode)
+        # Guide images
+        self.add_guide_button = QToolButton()
+        self.add_guide_button.setText("+")
+        self.add_guide_button.setAccessibleName("Add guide images")
+        self.add_guide_button.setToolTip("Add guide images")
+        self.add_guide_button.clicked.connect(self.choose_guides)
+        self.guide_list = ThumbnailList()
         self.guide_list.setFlow(QListWidget.Flow.LeftToRight)
-        self.guide_list.setWrapping(False)
-        self.guide_list.setMovement(QListWidget.Movement.Static)
+        self.guide_list.setWrapping(True)
         self.guide_list.setIconSize(QSize(GUIDE_ICON_SIZE, GUIDE_ICON_SIZE))
-        self.guide_list.setFixedHeight(GUIDE_ICON_SIZE + 24)
-        self.guide_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.guide_list.customContextMenuRequested.connect(self.guide_menu)
+        self.guide_list.setSpacing(4)
+        self.guide_list.menu_requested.connect(self.guide_menu)
         self.guide_list.itemDoubleClicked.connect(
             lambda item: self.remove_guide(item.data(Qt.ItemDataRole.UserRole)))
-        self.clear_guides_button = QPushButton("Clear guides")
+        remove = QAction(self.guide_list)
+        remove.setShortcuts([QKeySequence(QKeySequence.StandardKey.Delete),
+                             QKeySequence(Qt.Key.Key_Backspace)])
+        remove.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+        remove.triggered.connect(self.remove_current_guide)
+        self.guide_list.addAction(remove)
+        self.guide_heading = heading("", self.guide_list)
+        self.clear_guides_button = QPushButton("&Clear")
+        self.clear_guides_button.setAccessibleName("Clear guide images")
         self.clear_guides_button.clicked.connect(self.clear_guides)
+        self.guide_hint = HintLabel("Double-click or press Delete to remove")
+
+        # Balance and strictness
         self.weight = QSlider(Qt.Orientation.Horizontal)
         self.weight.setRange(0, 100)
         self.weight.setValue(self.settings.value("image_weight", 50, int))
-        self.weight.setMaximumWidth(160)
-        self.weight.setToolTip("How much the guide images count against the "
-                               "description when using both")
-        self.weight_label = QLabel()
         self.weight.valueChanged.connect(self.update_controls)
+        self.weight_text = label_for(self.weight, "Te&xt")
+        self.weight_visual = QLabel()
+        self.strictness = QSlider(Qt.Orientation.Horizontal)
+        self.strictness.setRange(5, 95)
+        self.strictness.setValue(round(100 * self.settings.value(
+            "face_threshold", face_search.DEFAULT_MATCH_THRESHOLD, float)))
+        self.strictness.setToolTip(
+            "How alike a face must be to count as the same person. Lower it "
+            "to find more photos (and more strangers), raise it to be stricter.")
+        self.strictness.valueChanged.connect(self.update_controls)
+        self.strictness_label = label_for(self.strictness, "St&rictness",
+                                          "Face match strictness")
+        self.strictness_value = WidestTextLabel("0.00")
 
-        self.progress = QProgressBar()
-        self.progress.setTextVisible(False)
-        self.progress.setMaximumWidth(300)
-        self.status = QLabel("Choose a folder, then enter a description or "
-                             "add guide images.")
-        self.elapsed = QLabel()
+        self.search_button = QPushButton("&Search")
+        self.search_button.setDefault(True)
+        self.search_button.clicked.connect(self.search)
 
-        self.results = QListWidget()
-        self.results.setViewMode(QListWidget.ViewMode.IconMode)
+        # Results
+        self.summary = StatusLabel(wrap=True)
+        scale_font(self.summary, 1.0, bold=True)
+        self.limit = QSpinBox()
+        self.limit.setRange(1, 1000)
+        self.limit.setValue(self.settings.value("limit", 100, int))
+        self.limit.setToolTip("How many results to show at most")
+        limit_label = label_for(self.limit, "Sh&ow", "Most results to show")
+        self.results = ThumbnailList()
+        self.results.setAccessibleName("Results")
         self.results.setIconSize(QSize(ICON_SIZE, ICON_SIZE))
-        # A fixed cell with room for two lines of label under each icon.
-        line = self.results.fontMetrics().lineSpacing()
-        self.results.setGridSize(QSize(ICON_SIZE + 24, ICON_SIZE + 2 * line + 16))
-        self.results.setResizeMode(QListWidget.ResizeMode.Adjust)
-        self.results.setMovement(QListWidget.Movement.Static)
         self.results.setUniformItemSizes(True)
         self.results.setWordWrap(True)
         self.results.itemClicked.connect(self.enlarge)
-        self.results.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.results.customContextMenuRequested.connect(self.result_menu)
+        self.results.itemActivated.connect(self.enlarge)     # Enter
+        self.results.menu_requested.connect(self.result_menu)
 
-        row1 = QHBoxLayout()
-        row1.addWidget(self.folder_edit, 1)
-        row1.addWidget(self.browse_button)
-        row1.addWidget(self.recursive)
-        row2 = QHBoxLayout()
-        row2.addWidget(self.prompt_edit, 1)
-        row2.addWidget(self.add_guide_button)
-        row2.addWidget(self.limit)
-        row2.addWidget(self.search_button)
-        self.guide_row = QWidget()
-        row_guides = QHBoxLayout(self.guide_row)
-        row_guides.setContentsMargins(0, 0, 0, 0)
-        row_guides.addWidget(QLabel("Guide images:"))
-        row_guides.addWidget(self.guide_list, 1)
-        weight_box = QVBoxLayout()
-        weight_box.addWidget(self.weight_label)
-        weight_box.addWidget(self.weight)
-        row_guides.addLayout(weight_box)
-        row_guides.addWidget(self.clear_guides_button)
-        row3 = QHBoxLayout()
-        row3.addWidget(self.status, 1)
-        row3.addWidget(self.elapsed)
-        row3.addWidget(self.progress)
+        # Status bar
+        self.status = QLabel("Choose a folder, then enter a description or "
+                             "add guide images.")
+        self.status.setIndent(self.fontMetrics().averageCharWidth())
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(False)
+        self.progress.setAccessibleName("Search progress")
+        self.elapsed = QLabel()
+        make_secondary(self.elapsed)
+        self.cancel_button = QPushButton("C&ancel")
+        self.cancel_button.clicked.connect(self.cancel)
+        bar = self.statusBar()
+        bar.addWidget(self.status, 1)
+        bar.addPermanentWidget(self.progress)
+        bar.addPermanentWidget(self.elapsed)
+        bar.addPermanentWidget(self.cancel_button)
+
+        # Sidebar layout
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(self.folder, 1)
+        folder_row.addWidget(self.browse_button)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(self.look_button)
+        mode_row.addWidget(self.person_button)
+        mode_row.addStretch(1)
+        guide_head = QHBoxLayout()
+        guide_head.addWidget(self.guide_heading, 1)
+        guide_head.addWidget(self.add_guide_button)
+        guide_foot = QHBoxLayout()
+        guide_foot.addWidget(self.guide_hint, 1)
+        guide_foot.addWidget(self.clear_guides_button)
+        tuning = QGridLayout()
+        tuning.addWidget(self.weight_text, 0, 0)
+        tuning.addWidget(self.weight, 0, 1)
+        tuning.addWidget(self.weight_visual, 0, 2)
+        tuning.addWidget(self.strictness_label, 1, 0)
+        tuning.addWidget(self.strictness, 1, 1)
+        tuning.addWidget(self.strictness_value, 1, 2)
+        tuning.setColumnStretch(1, 1)
+
+        self.sidebar = QWidget()
+        side = QVBoxLayout(self.sidebar)
+        self.gaps = []
+        side.addWidget(folder_heading)
+        side.addLayout(folder_row)
+        side.addWidget(self.recursive)
+        self.add_gap(side)
+        side.addWidget(heading("Search for"))
+        side.addLayout(mode_row)
+        self.add_gap(side)
+        side.addWidget(prompt_heading)
+        side.addWidget(self.prompt_edit)
+        self.add_gap(side)
+        side.addLayout(guide_head)
+        side.addWidget(self.guide_list)
+        side.addLayout(guide_foot)
+        self.add_gap(side)
+        side.addLayout(tuning)
+        self.add_gap(side)
+        side.addWidget(self.search_button)
+        side.addStretch(1)
+        # Scrolls rather than clipping when large text makes it too tall;
+        # not a tab stop itself, only its contents are.
+        self.side_scroll = QScrollArea()
+        self.side_scroll.setWidget(self.sidebar)
+        self.side_scroll.setWidgetResizable(True)
+        self.side_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.side_scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.side_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        header = QHBoxLayout()
+        header.addWidget(self.summary, 1)
+        header.addWidget(limit_label)
+        header.addWidget(self.limit)
+        main = QVBoxLayout()
+        main.addLayout(header)
+        main.addWidget(self.results, 1)
 
         central = QWidget()
-        layout = QVBoxLayout(central)
-        layout.addLayout(row1)
-        layout.addLayout(row2)
-        layout.addWidget(self.guide_row)
-        layout.addWidget(self.results, 1)
-        layout.addLayout(row3)
+        layout = QHBoxLayout(central)
+        layout.addWidget(self.side_scroll)
+        layout.addLayout(main, 1)
         self.setCentralWidget(central)
+
+        self.build_shortcuts()
+        self.apply_metrics()
+        em = self.fontMetrics().height()
+        self.setGeometry(initial_window_rect(
+            self.screen().availableGeometry(), QSize(75 * em, 50 * em)))
         self.prompt_edit.setFocus()
         self.update_controls()
+
+    def add_gap(self, layout):
+        """Space between sidebar sections, a line of text high."""
+        gap = QSpacerItem(0, 0)
+        layout.addItem(gap)
+        self.gaps.append(gap)
+
+    def build_shortcuts(self):
+        buttons = {"choose_folder": self.browse_button,
+                   "add_guides": self.add_guide_button,
+                   "search": self.search_button,
+                   "cancel": self.cancel_button}
+        self.shortcut_actions = {}
+        for name, keys in SHORTCUTS.items():
+            button = buttons[name]
+            action = QAction(self)
+            action.setShortcuts([QKeySequence(k) for k in keys])
+            action.triggered.connect(button.click)
+            self.addAction(action)
+            self.shortcut_actions[name] = action
+            shown = QKeySequence(keys[0]).toString(
+                QKeySequence.SequenceFormat.NativeText)
+            tip = button.toolTip()
+            button.setToolTip(f"{tip} ({shown})" if tip else shown)
+
+    def apply_metrics(self):
+        """Size things from the font, so larger text gets room to fit."""
+        em = self.fontMetrics().height()
+        for gap in self.gaps:
+            gap.changeSize(0, em)
+        # Allow for the scroll bar, so showing it does not squeeze the
+        # sidebar's contents.
+        scroll_bar = self.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent)
+        self.side_scroll.setFixedWidth(max(19 * em, 4 * GUIDE_ICON_SIZE)
+                                       + scroll_bar)
+        self.sidebar.layout().setContentsMargins(0, 0, scroll_bar, 0)
+        self.sidebar.layout().invalidate()
+        # Room for two rows of guides before the list scrolls.
+        self.guide_list.setFixedHeight(2 * (GUIDE_ICON_SIZE + 16) + 8)
+        # A fixed cell with room for two lines of label under each icon.
+        line = self.results.fontMetrics().lineSpacing()
+        self.results.setGridSize(QSize(ICON_SIZE + 24, ICON_SIZE + 2 * line + 16))
+        self.progress.setFixedWidth(12 * em)
+        self.limit.setMinimumWidth(
+            self.limit.fontMetrics().horizontalAdvance("0000") + 4 * em)
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.Type.FontChange:
+            refresh_scaled_fonts(self)
+            self.apply_metrics()
+        elif event.type() in (QEvent.Type.PaletteChange, THEME_CHANGE):
+            self.recolor_results()
+        super().changeEvent(event)
+
+    def recent_folders(self):
+        folders = self.settings.value("recent_folders", [], list)
+        return [f for f in folders if isinstance(f, str) and f]
+
+    def remember_folder(self, folder):
+        folders = [folder] + [f for f in self.recent_folders()
+                              if not same_path(f, folder)]
+        folders = folders[:self.RECENT_FOLDERS]
+        self.settings.setValue("recent_folders", folders)
+        self.settings.setValue("folder", folder)
+        self.folder.blockSignals(True)
+        self.folder.clear()
+        self.folder.addItems(folders)
+        self.folder.setCurrentText(folder)
+        self.folder.blockSignals(False)
 
     # ------------------------------------------------------------------
     # Guide images
@@ -272,6 +718,7 @@ class MainWindow(QMainWindow):
                 for i in range(self.guide_list.count())]
 
     def add_guides(self, paths):
+        added = 0
         for path in paths:
             path = os.path.normpath(os.path.abspath(path))
             if any(same_path(path, g) for g in self.guides()):
@@ -282,28 +729,80 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Image Inspect",
                                     f"Could not open {path}:\n{e}")
                 continue
-            item = QListWidgetItem(QIcon(square_pixmap(pixmap, GUIDE_ICON_SIZE)), "")
+            item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, path)
-            item.setToolTip(f"{path}\n(double-click or right-click to remove)")
+            item.setData(Qt.ItemDataRole.UserRole + 1,
+                         square_pixmap(pixmap, GUIDE_ICON_SIZE))
             self.guide_list.addItem(item)
+            added += 1
+        if added:
+            announce(self, f"{added} guide image{'s' if added > 1 else ''} added, "
+                     f"{self.guide_list.count()} in all")
         self.update_controls()
+
+    def person_mode(self):
+        return self.person_button.isChecked()
+
+    def set_person_mode(self, on):
+        (self.person_button if on else self.look_button).setChecked(True)
+
+    def update_guide_items(self):
+        """Show each guide's chosen face in person mode, its photo otherwise,
+        flagging guides in which no face was found."""
+        warning = self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning)
+        for i in range(self.guide_list.count()):
+            item = self.guide_list.item(i)
+            path = item.data(Qt.ItemDataRole.UserRole)
+            pixmap = item.data(Qt.ItemDataRole.UserRole + 1)
+            spoken = f"Guide image {os.path.basename(path)}"
+            tip = path
+            if self.person_mode() and path_key(path) in self.guide_faces:
+                _, crop = self.guide_faces[path_key(path)]
+                if crop is not None:
+                    pixmap = square_pixmap(crop, GUIDE_ICON_SIZE)
+                    spoken += ", showing the face searched for"
+                else:
+                    pixmap = with_badge(pixmap, warning)
+                    tip += "\nNo face found, so this photo is not used"
+                    spoken += ", warning: no face found, not used"
+            item.setIcon(QIcon(pixmap))
+            item.setToolTip(tip + "\n(double-click or press Delete to remove)")
+            item.setData(Qt.ItemDataRole.AccessibleTextRole, spoken)
 
     def remove_guide(self, path):
         for i in range(self.guide_list.count()):
             if same_path(self.guide_list.item(i).data(Qt.ItemDataRole.UserRole), path):
                 self.guide_list.takeItem(i)
+                announce(self, f"Removed guide image {os.path.basename(path)}")
                 break
+        self.guide_faces.pop(path_key(path), None)
         self.update_controls()
 
+    def remove_current_guide(self):
+        item = self.guide_list.currentItem()
+        if item is not None and self.worker is None:
+            self.remove_guide(item.data(Qt.ItemDataRole.UserRole))
+
     def clear_guides(self):
+        had = self.guide_list.count()
         self.guide_list.clear()
+        self.guide_faces.clear()
+        if had:
+            announce(self, "Guide images cleared")
         self.update_controls()
 
     def choose_guides(self):
         patterns = " ".join(f"*{e}" for e in clip_search.IMAGE_EXTENSIONS)
+        # Start where guides were last picked from, which is often not the
+        # folder being searched.
+        start = self.settings.value("guide_folder", "")
+        if not os.path.isdir(start):
+            start = self.folder.currentText()
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Choose guide images", self.folder_edit.text(),
+            self, "Choose guide images", start,
             f"Images ({patterns});;All files (*)")
+        if paths:
+            self.settings.setValue("guide_folder", os.path.dirname(paths[0]))
         self.add_guides(paths)
 
     def find_similar(self, path):
@@ -311,31 +810,44 @@ class MainWindow(QMainWindow):
         if self.worker is not None:
             return
         self.guide_list.clear()
+        self.guide_faces.clear()
         self.prompt_edit.clear()
+        self.set_person_mode(False)
         self.add_guides([path])
         self.search()
 
-    def guide_menu(self, pos):
-        item = self.guide_list.itemAt(pos)
-        if item is None:
+    def find_person(self, path):
+        """Search for the person in path, asking which if there are several."""
+        if self.worker is not None:
+            return
+        self.guide_list.clear()
+        self.guide_faces.clear()
+        self.prompt_edit.clear()
+        self.set_person_mode(True)
+        self.add_guides([path])
+        self.search()
+
+    def guide_menu(self, item, pos):
+        if item is None or self.worker is not None:
             return
         menu = QMenu(self)
-        menu.addAction("Remove", lambda: self.remove_guide(
+        menu.addAction("&Remove", lambda: self.remove_guide(
             item.data(Qt.ItemDataRole.UserRole)))
-        menu.exec(self.guide_list.viewport().mapToGlobal(pos))
+        menu.exec(pos)
 
-    def result_menu(self, pos):
-        item = self.results.itemAt(pos)
+    def result_menu(self, item, pos):
         if item is None or self.worker is not None:
             return
         path = item.data(Qt.ItemDataRole.UserRole)
         menu = QMenu(self)
-        menu.addAction("Find similar images", lambda: self.find_similar(path))
+        menu.addAction("&Open", lambda: self.enlarge(item))
+        menu.addAction("Find &similar images", lambda: self.find_similar(path))
+        menu.addAction("Find this &person", lambda: self.find_person(path))
         if any(same_path(path, g) for g in self.guides()):
-            menu.addAction("Remove from guide images", lambda: self.remove_guide(path))
+            menu.addAction("&Remove from guide images", lambda: self.remove_guide(path))
         else:
-            menu.addAction("Add to guide images", lambda: self.add_guides([path]))
-        menu.exec(self.results.viewport().mapToGlobal(pos))
+            menu.addAction("&Add to guide images", lambda: self.add_guides([path]))
+        menu.exec(pos)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls() and self.worker is None:
@@ -347,21 +859,56 @@ class MainWindow(QMainWindow):
                          in clip_search.IMAGE_EXTENSIONS])
 
     def update_controls(self):
-        """Reflect the query mode and whether a search is running."""
+        """Reflect the mode and whether a search is running. Controls that
+        do not apply are disabled rather than hidden, so nothing moves; their
+        labels are only quietened, as a disabled label is read out as
+        unavailable."""
         busy = self.worker is not None
+        person = self.person_mode()
         has_guides = self.guide_list.count() > 0
         has_text = bool(self.prompt_edit.text().strip())
-        for widget in (self.folder_edit, self.browse_button, self.recursive,
-                       self.prompt_edit, self.add_guide_button, self.limit,
-                       self.guide_row):
-            widget.setEnabled(not busy)
-        self.guide_row.setVisible(has_guides)
-        self.weight.setEnabled(not busy and has_text)
-        self.weight_label.setText(f"Text {100 - self.weight.value()}% · "
-                                  f"Images {self.weight.value()}%"
-                                  if has_text else "Images only")
-        self.search_button.setText("Cancel" if busy else "Search")
-        self.search_button.setEnabled(busy or has_text or has_guides)
+        self.sidebar.setEnabled(not busy)
+        self.limit.setEnabled(not busy)
+
+        self.prompt_edit.setPlaceholderText(
+            "Optional, e.g. at the beach" if person else "e.g. a dog on the beach")
+        self.guide_heading.setText("&Who" if person else "&Looks like")
+        self.guide_list.setAccessibleName(
+            "Guide photos of the person" if person else "Guide images")
+        self.guide_list.set_hint(
+            "Drop photos of the person here, or press + to choose them"
+            if person else "Drop images here, or press + to choose them (optional)")
+        self.clear_guides_button.setEnabled(has_guides)
+        self.guide_hint.setVisible(has_guides)
+        self.update_guide_items()
+
+        visual = "Person" if person else "Images"
+        self.weight_visual.setText(visual)
+        self.weight.setAccessibleName(f"Balance of text against {visual.lower()}")
+        balance = has_text and has_guides
+        self.weight.setEnabled(balance)
+        for label in (self.weight_text, self.weight_visual):
+            set_tone(label, None if balance else "secondary")
+        self.weight.setToolTip(
+            f"Text {100 - self.weight.value()}% · {visual} {self.weight.value()}%"
+            if balance else "Balances the description against the guide "
+            "images when you use both")
+        self.weight.setAccessibleDescription(
+            f"Text {100 - self.weight.value()} percent, {visual.lower()} "
+            f"{self.weight.value()} percent")
+        self.strictness.setEnabled(person)
+        for label in (self.strictness_label, self.strictness_value):
+            set_tone(label, None if person else "secondary")
+        self.strictness_value.setText(f"{self.strictness.value() / 100:.2f}")
+        self.strictness.setAccessibleDescription(
+            f"Similarity of at least {self.strictness.value() / 100:.2f}")
+
+        self.search_button.setEnabled(
+            not busy and (has_guides if person else has_text or has_guides))
+        self.progress.setVisible(busy)
+        self.cancel_button.setVisible(busy)
+        self.cancel_button.setEnabled(busy and not (
+            self.worker.isInterruptionRequested()))
 
     # ------------------------------------------------------------------
     # Searching
@@ -369,58 +916,60 @@ class MainWindow(QMainWindow):
 
     def choose_folder(self):
         folder = QFileDialog.getExistingDirectory(
-            self, "Choose image folder", self.folder_edit.text())
+            self, "Choose image folder", self.folder.currentText())
         if folder:
-            self.folder_edit.setText(os.path.normpath(folder))
+            self.folder.setCurrentText(os.path.normpath(folder))
 
-    def search_or_cancel(self):
-        if self.worker is not None:
+    def cancel(self):
+        if self.worker is not None and not self.worker.isInterruptionRequested():
             self.worker.requestInterruption()
-            self.search_button.setEnabled(False)
+            self.cancel_button.setEnabled(False)
             self.progress_text = "Cancelling…"
+            announce(self, "Cancelling")
             self.update_elapsed()
-        else:
-            self.search()
-
-    def describe_query(self, prompt, guides):
-        parts = []
-        if prompt:
-            parts.append(f"\"{prompt}\"")
-        if guides:
-            parts.append(f"{len(guides)} guide image" + ("s" if len(guides) > 1 else ""))
-        return " + ".join(parts)
 
     def search(self):
         if self.worker is not None:
             return
-        folder, prompt = self.folder_edit.text().strip(), self.prompt_edit.text().strip()
+        folder = self.folder.currentText().strip()
+        prompt = self.prompt_edit.text().strip()
         guides = self.guides()
         if not os.path.isdir(folder):
             QMessageBox.warning(self, "Image Inspect", "Choose a folder of images first.")
             return
-        if not prompt and not guides:
+        if not guides and (self.person_mode() or not prompt):
             return
-        self.settings.setValue("folder", folder)
+        self.remember_folder(os.path.normpath(folder))
         self.settings.setValue("recursive", self.recursive.isChecked())
         self.settings.setValue("image_weight", self.weight.value())
+        self.settings.setValue("match", MATCH_PERSON if self.person_mode()
+                               else MATCH_LOOK)
+        self.settings.setValue("face_threshold", self.strictness.value() / 100)
+        self.settings.setValue("limit", self.limit.value())
 
         # Clear the old results straight away, so it is plain that a new
         # search has started even if indexing new files takes a while.
         self.results.clear()
-        self.result_text = ""
-        self.query_text = self.describe_query(prompt, guides)
+        self.summary.set_status("Searching…")
         self.worker = SearchWorker(self.state, folder, self.recursive.isChecked(),
                                    prompt, guides, self.weight.value() / 100,
-                                   self.limit.value())
+                                   self.limit.value(),
+                                   MATCH_PERSON if self.person_mode() else MATCH_LOOK,
+                                   {k: v[0] for k, v in self.guide_faces.items()},
+                                   self.strictness.value() / 100)
+        self.pending_choices = []
         self.worker.progress.connect(self.on_progress)
+        self.worker.guide_faces.connect(self.on_guide_faces)
         self.worker.finished_ok.connect(self.show_results)
         self.worker.failed.connect(self.on_failed)
         self.worker.finished.connect(self.on_worker_done)
         self.update_controls()
         self.progress_text = "Starting…"
         self.clock.start()
+        self.last_spoken = 0
         self.ticker.start()
         self.update_elapsed()
+        announce(self, "Searching")
         self.worker.start()
 
     def on_progress(self, message, done, total):
@@ -429,8 +978,14 @@ class MainWindow(QMainWindow):
             self.progress.setValue(done)
             if message.startswith("Downloading"):
                 text = f"{message}: {done >> 20} / {total >> 20} MB"
+                spoken = f"{message}, {round(100 * done / total)} percent"
             else:
                 text = f"{message}: {done:,} / {total:,}"
+                spoken = f"{message.split(' (')[0]}, {done:,} of {total:,}"
+            # A long job is spoken now and then, not file by file.
+            if self.clock.elapsed() - self.last_spoken >= ANNOUNCE_PROGRESS_EVERY:
+                self.last_spoken = self.clock.elapsed()
+                announce(self, spoken)
         else:
             self.progress.setRange(0, 0)    # busy indicator
             text = message + "…"
@@ -439,59 +994,147 @@ class MainWindow(QMainWindow):
         self.update_elapsed()
 
     def update_elapsed(self):
-        self.status.setText(f"Searching for {self.query_text} — {self.progress_text}")
+        self.status.setText(self.progress_text)
         self.elapsed.setText(f"{self.clock.elapsed() / 1000:.1f} s")
+
+    def guide_highlight(self):
+        """The background marking guide images among the results."""
+        color = QColor(self.palette().color(QPalette.ColorRole.Highlight))
+        color.setAlpha(70)
+        return color
+
+    def recolor_results(self):
+        if not hasattr(self, "results"):
+            return                          # Still being built.
+        for i in range(self.results.count()):
+            item = self.results.item(i)
+            if item.data(Qt.ItemDataRole.UserRole + 2):
+                item.setBackground(self.guide_highlight())
 
     def show_results(self, results):
         self.results.clear()
-        guides = self.worker.guides
-        for path, scores, thumb in results:
-            pixmap = QPixmap()
-            if thumb:
-                pixmap.loadFromData(thumb)
-            if len(scores) == 1:
-                label = f"{next(iter(scores.values())):.3f}"
-            else:
-                label = f"text {scores['text']:.3f} · image {scores['image']:.3f}"
+        worker = self.worker
+        guides = worker.guides
+        person = worker.match == MATCH_PERSON
+        for n, (path, scores, thumb, face_box) in enumerate(results):
+            # One score under the thumbnail: the guide part's when there is
+            # one; the full breakdown goes in the tooltip.
+            shown = scores.get("person", scores.get("image", scores.get("text")))
+            label = f"{shown:.3f}"
+            name = os.path.basename(path)
+            tip = path + "".join(f"\n{k}: {v:.3f}" for k, v in scores.items())
+            spoken = (f"{n + 1}. {name}, "
+                      + ", ".join(f"{k} similarity {v:.2f}" for k, v in scores.items()))
             is_guide = any(same_path(path, g) for g in guides)
             if is_guide:
-                label = "★ guide\n" + label
-            item = QListWidgetItem(QIcon(square_pixmap(pixmap, ICON_SIZE)), label)
+                label = "★ " + label
+                tip += "\n(guide image)"
+                spoken += ", guide image"
+            if face_box is not None:
+                spoken += f", matching face at the {describe_place(face_box)}"
+            item = QListWidgetItem(
+                QIcon(square_pixmap(pixmap_from_bytes(thumb), ICON_SIZE)), label)
             item.setData(Qt.ItemDataRole.UserRole, path)
-            item.setToolTip(path + ("\n(guide image)" if is_guide else ""))
+            item.setData(Qt.ItemDataRole.UserRole + 1, face_box)
+            item.setData(Qt.ItemDataRole.UserRole + 2, is_guide)
+            item.setData(Qt.ItemDataRole.AccessibleTextRole, spoken)
+            item.setToolTip(tip)
             if is_guide:
-                item.setBackground(GUIDE_COLOR)
+                item.setBackground(self.guide_highlight())
             self.results.addItem(item)
+        if self.results.count():
+            self.results.setCurrentRow(0)
+
         count = len(self.state["index"].paths)
-        cancelled = self.worker.isInterruptionRequested()
-        self.result_text = (
-            f"Showing {len(results)} best of {count:,} "
-            f"{'indexed ' if cancelled else ''}images for {self.query_text}"
-            f"{' (indexing was cancelled)' if cancelled else ''}. "
-            "Edit the description or guide images and press Search to search again.")
+        noun = "photo" if len(results) == 1 else "photos"
+        if person:
+            summary = (f"{len(results)} {noun} of the person"
+                       if len(results) < worker.limit
+                       else f"The best {len(results)} {noun} of the person")
+        else:
+            summary = f"The best {len(results)} of {count:,} images"
+        if worker.prompt:
+            summary += f" matching “{worker.prompt}”"
+        notes = []
+        if person:
+            no_face = sum(1 for p in guides if path_key(p) in worker.known_faces
+                          and worker.known_faces[path_key(p)] is None)
+            if no_face:
+                notes.append(f"{no_face} guide photo{'s' if no_face > 1 else ''} "
+                             "with no face ignored")
+        if worker.isInterruptionRequested():
+            notes.append("indexing was cancelled, so only part of the folder "
+                         "was searched")
+        if notes:
+            self.summary.set_status(f"{summary} ({'; '.join(notes)})", "problem")
+        else:
+            self.summary.set_status(summary)
+        announce(self, self.summary.accessibleName(), important=True)
+
+    def on_guide_faces(self, found):
+        for path, faces in found:
+            if len(faces) == 1:
+                self.guide_faces[path_key(path)] = (
+                    faces[0].embedding, pixmap_from_bytes(faces[0].crop))
+            elif not faces:
+                self.guide_faces[path_key(path)] = (None, None)
+            else:
+                self.pending_choices.append((path, faces))
+        self.update_guide_items()
+
+    def ask_which_faces(self):
+        """Ask which person is meant in each guide showing several; False
+        if the user cancels."""
+        for path, faces in self.pending_choices:
+            picker = FacePickerDialog(path, faces, self)
+            if not picker.exec() or picker.choice is None:
+                return False
+            face = faces[picker.choice]
+            self.guide_faces[path_key(path)] = (face.embedding,
+                                                pixmap_from_bytes(face.crop))
+        self.update_guide_items()
+        return True
 
     def on_failed(self, message):
-        self.result_text = "Search failed."
+        self.summary.set_status("Search failed", "problem")
         QMessageBox.critical(self, "Image Inspect", message)
 
     def on_worker_done(self):
         self.ticker.stop()
-        self.elapsed.setText(f"{self.clock.elapsed() / 1000:.1f} s")
-        self.status.setText(self.result_text)
+        seconds = self.clock.elapsed() / 1000
+        self.elapsed.setText("")
+        cancelled = self.worker.isInterruptionRequested()
+        self.status.setText(f"{'Cancelled' if cancelled else 'Done'} "
+                            f"in {seconds:.1f} s")
+        needs_choice = self.worker.needs_choice
         self.worker = None
-        self.progress.setRange(0, 1)
-        self.progress.setValue(0)
         self.update_controls()
         self.results.scrollToTop()
         self.prompt_edit.setFocus()
         self.prompt_edit.selectAll()
+        if needs_choice:
+            # The search stopped to ask which person is meant; carry on
+            # once that is known.
+            self.summary.set_status("Choose which person to search for")
+            if self.ask_which_faces():
+                QTimer.singleShot(0, self.search)
+            else:
+                self.summary.set_status("Search cancelled")
+                announce(self, "Search cancelled")
 
     def enlarge(self, item):
+        if self.enlarging or item is None:
+            return
         path = item.data(Qt.ItemDataRole.UserRole)
+        self.enlarging = True
         try:
-            ImageDialog(path, self, on_find_similar=self.find_similar).exec()
+            ImageDialog(path, self, on_find_similar=self.find_similar,
+                        on_find_person=self.find_person,
+                        face_box=item.data(Qt.ItemDataRole.UserRole + 1)).exec()
         except Exception as e:                               # noqa: BLE001
             QMessageBox.warning(self, "Image Inspect", f"Could not open {path}:\n{e}")
+        finally:
+            self.enlarging = False
 
     def closeEvent(self, event):
         if self.worker is not None:
@@ -502,6 +1145,8 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    app.setApplicationName("ImageInspect")
+    apply_windows_appearance(app)
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
