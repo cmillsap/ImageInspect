@@ -4,7 +4,8 @@ Image Inspect
 Pick a folder, then describe what you are looking for, add guide images
 that look like it, or both, and see the images CLIP thinks match best.
 Guide images can instead pick out a person, matched by face recognition.
-Click a thumbnail to enlarge it; right-click it to search for similar ones.
+Click a thumbnail to enlarge it; right-click it to search for similar ones
+or have a local language model describe it.
 """
 
 import os
@@ -12,8 +13,8 @@ import sys
 
 import numpy as np
 from PIL import Image
-from PyQt6.QtCore import (QElapsedTimer, QEvent, QPoint, QSettings, QSize,
-                          Qt, QThread, QTimer, QUrl, pyqtSignal)
+from PyQt6.QtCore import (QElapsedTimer, QEvent, QObject, QPoint, QSettings,
+                          QSize, Qt, QThread, QTimer, QUrl, pyqtSignal)
 from PyQt6.QtGui import (QAction, QColor, QContextMenuEvent, QDesktopServices,
                          QIcon, QImage, QKeySequence, QPainter, QPalette,
                          QPixmap)
@@ -21,12 +22,14 @@ from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
                              QDialog, QFileDialog, QFrame, QGridLayout,
                              QHBoxLayout, QLabel, QLineEdit, QListWidget,
                              QListWidgetItem, QMainWindow, QMenu, QMessageBox,
-                             QProgressBar, QPushButton, QRadioButton,
+                             QPlainTextEdit, QProgressBar, QPushButton, QRadioButton,
                              QScrollArea, QSlider, QSpacerItem, QSpinBox,
                              QStyle, QToolButton, QVBoxLayout, QWidget)
 
 import clip_search
+import describe
 import face_search
+import models
 from image_io import open_image
 from ui_support import (THEME_CHANGE, HintLabel, StatusLabel, WidestTextLabel,
                         WrapLabel, announce, apply_windows_appearance,
@@ -189,6 +192,13 @@ class SearchWorker(QThread):
         return face_search.person_template(np.stack(embeddings))
 
 
+def set_fraction(bar, done, total):
+    """Show done of total on a progress bar; in thousandths, since a
+    progress bar holds 32-bit numbers and downloads run past 2 GB."""
+    bar.setRange(0, 1000)
+    bar.setValue(1000 * done // total)
+
+
 def pixmap_from_bytes(data):
     pixmap = QPixmap()
     if data:
@@ -274,17 +284,285 @@ def with_badge(pixmap, icon):
     return pixmap
 
 
+class DescribeWorker(QThread):
+    """Writes one description, downloading and loading the model first if
+    need be. If the GPU build will not load and the CPU build is not
+    downloaded, it stops with needs_cpu_model set so the user can be asked
+    about that download."""
+
+    progress = pyqtSignal(str, int, int)
+    text = pyqtSignal(str)              # the description so far
+    finished_ok = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, state, path, variant):
+        super().__init__()
+        self.state, self.path, self.variant = state, path, variant
+        self.view = None                    # the DescriptionPanel shown to
+        self.needs_cpu_model = False
+
+    def run(self):
+        try:
+            text = describe.describe_file(
+                self.state, self.path, self.variant, self.progress.emit,
+                self.text.emit, self.isInterruptionRequested)
+            if text is not None:
+                self.finished_ok.emit(text)
+        except models.Cancelled:
+            pass
+        except describe.GpuUnavailable:
+            self.needs_cpu_model = True
+        except Exception as e:                               # noqa: BLE001
+            self.failed.emit(str(e))
+
+
+def download_question(variant, size, gpu_failed=False):
+    """The question asked before downloading the description model, as
+    (text, informative text)."""
+    if gpu_failed:
+        hardware = ("The graphics card could not run the version already "
+                    "downloaded, so this is the version for the processor. "
+                    "It takes about half a minute per photo.")
+    elif variant == "cuda":
+        hardware = (f"It will run on the graphics card ({models.nvidia_gpu()}), "
+                    "taking a few seconds per photo.")
+    else:
+        hardware = ("It will run on the processor, taking about half a "
+                    "minute per photo.")
+    return (f"Describing photos needs {describe.MODEL_LABEL}, a "
+            f"{describe.format_size(size)} download.",
+            "It runs on this computer, so your photos are not sent anywhere. "
+            f"{hardware}\n\nIt is downloaded once, from Hugging Face, to "
+            f"{models.MODEL_DIR}.")
+
+
+def agree_to_download(parent, variant, gpu_failed=False):
+    """Ask before downloading the description model; True to go ahead,
+    including when there is nothing to download."""
+    size = describe.download_size(variant)
+    if not size:
+        return True
+    free = describe.free_space()
+    if free < size + (1 << 30):
+        QMessageBox.warning(
+            parent, "Image Inspect",
+            f"Describing photos needs a {describe.format_size(size)} "
+            f"download, but there is only {describe.format_size(free)} free "
+            f"on the drive holding {models.MODEL_DIR}.")
+        return False
+    text, details = download_question(variant, size, gpu_failed)
+    box = QMessageBox(QMessageBox.Icon.Question, "Download description model?",
+                      text, parent=parent)
+    box.setInformativeText(details)
+    download = box.addButton("&Download", QMessageBox.ButtonRole.AcceptRole)
+    box.addButton("Not now", QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(download)
+    box.exec()
+    return box.clickedButton() is download
+
+
+class DescriptionService(QObject):
+    """Writes descriptions for the enlarged views, one at a time, keeping
+    the model loaded between them.
+
+    A view that closes stops its description; one asked for while another
+    is still stopping waits its turn.
+    """
+
+    device_changed = pyqtSignal()
+
+    def __init__(self, state, parent=None):
+        super().__init__(parent)
+        self.state = state
+        self.worker = None
+        self.pending = None                 # (path, variant, view) to start next
+        self.cpu_only = False               # The GPU could not run the model
+
+    def cache(self):
+        if "descriptions" not in self.state:
+            self.state["descriptions"] = describe.DescriptionCache()
+        return self.state["descriptions"]
+
+    def start(self, path, view):
+        """Describe path into view, asking first if the model needs
+        downloading. False if the user would rather not."""
+        cached = self.cache().get(path)
+        if cached is not None:
+            view.show_done(cached, cached=True)
+            return True
+        describer = self.state.get("describer")
+        if describer is not None:
+            variant = describer.variant
+        else:
+            variant = "cpu" if self.cpu_only else describe.preferred_variant()
+            if not agree_to_download(view.window(), variant):
+                view.show_stopped("The description model was not downloaded")
+                return False
+        view.show_started()
+        if self.worker is not None:
+            self.worker.requestInterruption()
+            self.worker.view = None
+            self.pending = (path, variant, view)
+        else:
+            self.run(path, variant, view)
+        return True
+
+    def run(self, path, variant, view):
+        worker = self.worker = DescribeWorker(self.state, path, variant)
+        worker.view = view
+        worker.progress.connect(
+            lambda m, d, t: worker.view and worker.view.show_progress(m, d, t))
+        worker.text.connect(lambda t: worker.view and worker.view.show_text(t))
+        worker.finished_ok.connect(
+            lambda t: worker.view and worker.view.show_done(t))
+        worker.failed.connect(lambda m: worker.view and worker.view.show_failed(m))
+        worker.finished.connect(self.on_worker_done)
+        worker.start()
+
+    def stop(self, view):
+        """Stop describing for view, which is closing or was told to stop."""
+        if self.pending and self.pending[2] is view:
+            self.pending = None
+        if self.worker is not None and self.worker.view is view:
+            self.worker.requestInterruption()
+            self.worker.view = None
+
+    def on_worker_done(self):
+        worker, self.worker = self.worker, None
+        self.device_changed.emit()
+        if self.pending:
+            path, variant, view = self.pending
+            self.pending = None
+            self.run(path, variant, view)
+        elif worker.needs_cpu_model and worker.view is not None:
+            view = worker.view
+            self.cpu_only = True
+            if agree_to_download(view.window(), "cpu", gpu_failed=True):
+                self.run(worker.path, "cpu", view)
+            else:
+                view.show_stopped("The description model was not downloaded")
+
+    def shutdown(self):
+        self.pending = None
+        if self.worker is not None:
+            self.worker.requestInterruption()
+            self.worker.wait()
+
+
+class DescriptionPanel(QWidget):
+    """Where an enlarged photo's description appears as it is written, with
+    its progress and a Copy button. What happens is announced to screen
+    readers, ending with the description itself."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.text = QPlainTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard)
+        self.heading = heading("Desc&ription", self.text)
+        self.status = StatusLabel(wrap=True)
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(False)
+        self.progress.setAccessibleName("Description progress")
+        self.note = WrapLabel("Written by an AI model, which can get details "
+                              "wrong, such as how many people there are.")
+        make_secondary(self.note)
+        self.copy_button = QPushButton("&Copy")
+        self.copy_button.setAccessibleName("Copy description")
+        self.copy_button.clicked.connect(self.copy)
+        self.stop_button = QPushButton("S&top")
+        self.stop_button.setAccessibleName("Stop describing")
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(self.stop_button)
+        buttons.addWidget(self.copy_button)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.heading)
+        layout.addWidget(self.text, 1)
+        layout.addWidget(self.status)
+        layout.addWidget(self.progress)
+        layout.addWidget(self.note)
+        layout.addLayout(buttons)
+        self.clock = QElapsedTimer()
+        self.last_spoken = 0
+        self.set_busy(False)
+
+    def set_busy(self, busy):
+        self.progress.setVisible(busy)
+        self.stop_button.setVisible(busy)
+        self.copy_button.setEnabled(not busy and bool(self.text.toPlainText()))
+
+    def show_started(self):
+        self.text.clear()
+        self.status.set_status("Starting…")
+        self.progress.setRange(0, 0)
+        self.set_busy(True)
+        self.clock.start()
+        self.last_spoken = 0
+        announce(self, "Describing the photo")
+
+    def show_progress(self, message, done, total):
+        if total:
+            set_fraction(self.progress, done, total)
+            self.status.set_status(f"{message}: {done >> 20:,} / {total >> 20:,} MB")
+            if self.clock.elapsed() - self.last_spoken >= ANNOUNCE_PROGRESS_EVERY:
+                self.last_spoken = self.clock.elapsed()
+                announce(self, f"{message.split(' (')[0]}, "
+                         f"{round(100 * done / total)} percent")
+        else:
+            self.progress.setRange(0, 0)
+            self.status.set_status(message + "…")
+
+    def show_text(self, text):
+        self.text.setPlainText(text)
+
+    def show_done(self, text, cached=False):
+        self.text.setPlainText(text)
+        self.set_busy(False)
+        self.status.set_status("Described earlier" if cached else
+                               f"Written by {describe.MODEL_LABEL} on the "
+                               f"{models.device()}", "done")
+        announce(self, f"Description: {text}")
+
+    def show_failed(self, message):
+        self.set_busy(False)
+        self.status.set_status(f"Could not describe the photo: {message}",
+                               "problem")
+        announce(self, self.status.accessibleName(), important=True)
+
+    def show_stopped(self, message):
+        self.set_busy(False)
+        self.status.set_status(message)
+        announce(self, message)
+
+    def copy(self):
+        QApplication.clipboard().setText(self.text.toPlainText())
+        announce(self, "Description copied")
+
+
 class ImageDialog(QDialog):
-    """One image, scaled to fit the screen, with the matched face boxed."""
+    """One image, scaled to fit the screen, with the matched face boxed.
+
+    With descriptions (a DescriptionService), it can also describe the
+    photo, in a panel beside it.
+    """
+
+    PANEL_WIDTH_EM = 22
 
     def __init__(self, path, parent=None, on_find_similar=None,
-                 on_find_person=None, face_box=None):
+                 on_find_person=None, face_box=None, descriptions=None,
+                 describe_now=False):
         super().__init__(parent)
         self.setWindowTitle(path)
         self.path = path
+        self.descriptions = descriptions
 
         screen = self.screen().availableGeometry()
         max_size = (int(screen.width() * 0.9), int(screen.height() * 0.85))
+        self.max_size = max_size
         pixmap = load_pixmap(path, max_size)
         if face_box is not None:
             x1, y1, x2, y2 = face_box
@@ -297,6 +575,7 @@ class ImageDialog(QDialog):
             painter.drawRect(round(x1 * w), round(y1 * h),
                              round((x2 - x1) * w), round((y2 - y1) * h))
             painter.end()
+        self.pixmap = pixmap
         self.image = QLabel()
         self.image.setPixmap(pixmap)
         self.image.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -325,12 +604,57 @@ class ImageDialog(QDialog):
             person_button.clicked.connect(lambda: (self.accept(),
                                                    on_find_person(self.path)))
             buttons.addWidget(person_button)
+        self.panel = None
+        if descriptions is not None:
+            self.describe_button = QPushButton("&Describe")
+            self.describe_button.setToolTip("Describe the photo in words (Ctrl+D)")
+            self.describe_button.clicked.connect(self.describe)
+            buttons.addWidget(self.describe_button)
+            describe_action = QAction(self)
+            describe_action.setShortcut(QKeySequence(DESCRIBE_SHORTCUT))
+            describe_action.triggered.connect(self.describe)
+            self.addAction(describe_action)
+            self.panel = DescriptionPanel()
+            self.panel.stop_button.clicked.connect(self.stop_describing)
+            self.panel.hide()
         buttons.addWidget(folder_button)
         buttons.addWidget(open_button)
 
+        top = QHBoxLayout()
+        top.addWidget(self.image, 1)
+        if self.panel is not None:
+            top.addWidget(self.panel)
         layout = QVBoxLayout(self)
-        layout.addWidget(self.image, 1)
+        layout.addLayout(top, 1)
         layout.addLayout(buttons)
+        if describe_now and descriptions is not None:
+            QTimer.singleShot(0, self.describe)
+
+    def describe(self):
+        """Show the description panel and write the photo's description,
+        unless one is already being written."""
+        if self.panel.isHidden():
+            width = self.PANEL_WIDTH_EM * self.fontMetrics().height()
+            self.panel.setFixedWidth(width)
+            room = QSize(self.max_size[0] - width, self.max_size[1])
+            if self.pixmap.width() > room.width():
+                self.image.setPixmap(self.pixmap.scaled(
+                    room, Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation))
+            self.panel.show()
+            self.adjustSize()
+        elif not self.panel.stop_button.isHidden():
+            return
+        self.descriptions.start(self.path, self.panel)
+
+    def stop_describing(self):
+        self.descriptions.stop(self.panel)
+        self.panel.show_stopped("Stopped")
+
+    def done(self, result):
+        if self.panel is not None:
+            self.descriptions.stop(self.panel)
+        super().done(result)
 
     def show_in_folder(self):
         if sys.platform == "win32":
@@ -401,6 +725,9 @@ SHORTCUTS = {
     "cancel": ["Esc"],
 }
 
+# Describes the current result, in the main window and enlarged view.
+DESCRIBE_SHORTCUT = "Ctrl+D"
+
 # How often indexing progress is spoken, in milliseconds.
 ANNOUNCE_PROGRESS_EVERY = 15000
 
@@ -425,6 +752,8 @@ class MainWindow(QMainWindow):
         self.settings = settings or QSettings("ImageInspect", "ImageInspect")
         self.state = {}
         self.worker = None
+        self.descriptions = DescriptionService(self.state, self)
+        self.descriptions.device_changed.connect(self.update_device)
         self.clock = QElapsedTimer()
         self.ticker = QTimer(self)
         self.ticker.setInterval(250)
@@ -558,11 +887,15 @@ class MainWindow(QMainWindow):
         make_secondary(self.elapsed)
         self.cancel_button = QPushButton("C&ancel")
         self.cancel_button.clicked.connect(self.cancel)
+        # Which hardware the models run on, once one has loaded.
+        self.device = QLabel()
+        make_secondary(self.device)
         bar = self.statusBar()
         bar.addWidget(self.status, 1)
         bar.addPermanentWidget(self.progress)
         bar.addPermanentWidget(self.elapsed)
         bar.addPermanentWidget(self.cancel_button)
+        bar.addPermanentWidget(self.device)
 
         # Sidebar layout
         folder_row = QHBoxLayout()
@@ -663,6 +996,11 @@ class MainWindow(QMainWindow):
                 QKeySequence.SequenceFormat.NativeText)
             tip = button.toolTip()
             button.setToolTip(f"{tip} ({shown})" if tip else shown)
+        # Describes the current result, which has no button of its own.
+        self.describe_action = QAction(self)
+        self.describe_action.setShortcut(QKeySequence(DESCRIBE_SHORTCUT))
+        self.describe_action.triggered.connect(self.describe_current)
+        self.addAction(self.describe_action)
 
     def apply_metrics(self):
         """Size things from the font, so larger text gets room to fit."""
@@ -841,6 +1179,8 @@ class MainWindow(QMainWindow):
         path = item.data(Qt.ItemDataRole.UserRole)
         menu = QMenu(self)
         menu.addAction("&Open", lambda: self.enlarge(item))
+        menu.addAction(f"&Describe image	{DESCRIBE_SHORTCUT}",
+                       lambda: self.enlarge(item, describe_now=True))
         menu.addAction("Find &similar images", lambda: self.find_similar(path))
         menu.addAction("Find this &person", lambda: self.find_person(path))
         if any(same_path(path, g) for g in self.guides()):
@@ -974,8 +1314,7 @@ class MainWindow(QMainWindow):
 
     def on_progress(self, message, done, total):
         if total:
-            self.progress.setRange(0, total)
-            self.progress.setValue(done)
+            set_fraction(self.progress, done, total)
             if message.startswith("Downloading"):
                 text = f"{message}: {done >> 20} / {total >> 20} MB"
                 spoken = f"{message}, {round(100 * done / total)} percent"
@@ -1109,6 +1448,7 @@ class MainWindow(QMainWindow):
         needs_choice = self.worker.needs_choice
         self.worker = None
         self.update_controls()
+        self.update_device()
         self.results.scrollToTop()
         self.prompt_edit.setFocus()
         self.prompt_edit.selectAll()
@@ -1122,7 +1462,19 @@ class MainWindow(QMainWindow):
                 self.summary.set_status("Search cancelled")
                 announce(self, "Search cancelled")
 
-    def enlarge(self, item):
+    def describe_current(self):
+        item = self.results.currentItem()
+        if item is None:
+            announce(self, "No photo to describe; search first")
+            return
+        self.enlarge(item, describe_now=True)
+
+    def update_device(self):
+        """Show which hardware the models run on, once one has loaded."""
+        if self.state.keys() & {"clip", "faces", "describer"}:
+            self.device.setText(f"Running on {models.device()}")
+
+    def enlarge(self, item, describe_now=False):
         if self.enlarging or item is None:
             return
         path = item.data(Qt.ItemDataRole.UserRole)
@@ -1130,7 +1482,9 @@ class MainWindow(QMainWindow):
         try:
             ImageDialog(path, self, on_find_similar=self.find_similar,
                         on_find_person=self.find_person,
-                        face_box=item.data(Qt.ItemDataRole.UserRole + 1)).exec()
+                        face_box=item.data(Qt.ItemDataRole.UserRole + 1),
+                        descriptions=self.descriptions,
+                        describe_now=describe_now).exec()
         except Exception as e:                               # noqa: BLE001
             QMessageBox.warning(self, "Image Inspect", f"Could not open {path}:\n{e}")
         finally:
@@ -1140,6 +1494,7 @@ class MainWindow(QMainWindow):
         if self.worker is not None:
             self.worker.requestInterruption()
             self.worker.wait()
+        self.descriptions.shutdown()
         super().closeEvent(event)
 
 

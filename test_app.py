@@ -22,7 +22,9 @@ from PyQt6.QtWidgets import (QAbstractButton, QAbstractSpinBox,  # noqa: E402
                              QScrollArea, QSlider)
 
 import app                                                    # noqa: E402
+import describe                                               # noqa: E402
 import face_search                                            # noqa: E402
+import models                                                 # noqa: E402
 import ui_support                                             # noqa: E402
 from app import SHORTCUTS, FacePickerDialog, ImageDialog, MainWindow  # noqa: E402
 
@@ -554,3 +556,263 @@ class TestWindowsAppearance:
         monkeypatch.setattr(ui_support, "text_scale_factor", lambda: 1.0)
         ui_support.apply_windows_appearance(qapp)
         assert qapp.font().pointSizeF() == pytest.approx(9)
+
+
+# ============================================================================
+# Describing photos
+# ============================================================================
+
+class FakeService:
+    """A DescriptionService that only records what it is asked."""
+
+    def __init__(self):
+        self.started, self.stopped = [], []
+
+    def start(self, path, view):
+        self.started.append(path)
+        view.show_started()
+        return True
+
+    def stop(self, view):
+        self.stopped.append(view)
+
+
+@pytest.fixture
+def described(qapp, photos):
+    """An enlarged view that can describe its photo."""
+    service = FakeService()
+    dialog = ImageDialog(photos[0], descriptions=service)
+    dialog.service = service
+    yield dialog
+    dialog.close()
+
+
+@pytest.fixture
+def service(window, tmp_path, monkeypatch):
+    """The window's DescriptionService, with its cache in a scratch file and
+    the model never downloaded or run."""
+    window.state["descriptions"] = describe.DescriptionCache(str(tmp_path / "db"))
+    monkeypatch.setattr(describe, "preferred_variant", lambda: "cuda")
+    runs = []
+    monkeypatch.setattr(window.descriptions, "run",
+                        lambda path, variant, view: runs.append((path, variant)))
+    window.descriptions.runs = runs
+    return window.descriptions
+
+
+class TestDescribing:
+
+    def test_describe_button_opens_the_panel(self, described, photos):
+        assert described.panel.isHidden()
+        described.describe_button.click()
+        assert not described.panel.isHidden()
+        assert described.service.started == [photos[0]]
+
+    def test_describing_twice_at_once_starts_once(self, described):
+        described.describe()
+        described.describe()
+        assert len(described.service.started) == 1
+
+    def test_ctrl_d_describes(self, described):
+        action = next(a for a in described.actions()
+                      if a.shortcut() == QKeySequence(app.DESCRIBE_SHORTCUT))
+        action.trigger()
+        assert len(described.service.started) == 1
+
+    def test_closing_stops_the_description(self, described):
+        described.describe()
+        described.reject()
+        assert described.service.stopped == [described.panel]
+
+    def test_stop_button(self, described, announcements):
+        described.describe()
+        described.panel.stop_button.click()
+        assert described.service.stopped == [described.panel]
+        assert announcements[-1] == ("Stopped", False)
+        assert described.panel.stop_button.isHidden()
+
+    def test_access_keys_are_unique(self, described):
+        described.describe()
+        texts = [b.text() for b in described.findChildren(QAbstractButton)]
+        texts += [label.text() for label in described.findChildren(QLabel)
+                  if label.buddy() is not None]
+        keys = [k for k in map(mnemonic, texts) if k]
+        assert len(keys) == len(set(keys)), sorted(keys)
+
+    def test_without_a_service_there_is_no_describe_button(self, qapp, photos):
+        dialog = ImageDialog(photos[0])
+        assert not hasattr(dialog, "describe_button")
+        dialog.close()
+
+
+class TestDescriptionPanel:
+
+    @pytest.fixture
+    def panel(self, qapp):
+        panel = app.DescriptionPanel()
+        yield panel
+        panel.close()
+
+    def test_text_box_is_named(self, panel):
+        assert panel.text.accessibleName() == "Description"
+        assert panel.heading.buddy() is panel.text
+
+    def test_starting_is_announced(self, panel, announcements):
+        panel.show_started()
+        assert announcements == [("Describing the photo", False)]
+        assert not panel.copy_button.isEnabled()
+
+    def test_the_description_is_read_out_when_done(self, panel, announcements,
+                                                   monkeypatch):
+        monkeypatch.setattr(models, "device", lambda: "GPU (Test GPU)")
+        panel.show_started()
+        panel.show_text("A dog")
+        assert len(announcements) == 1      # Not word by word.
+        panel.show_done("A dog on a beach.")
+        assert announcements[-1] == ("Description: A dog on a beach.", False)
+        assert panel.text.toPlainText() == "A dog on a beach."
+        assert panel.status.accessibleName() == \
+            "Done: Written by Phi-3.5-vision on the GPU (Test GPU)"
+        assert panel.copy_button.isEnabled()
+
+    def test_failure_is_an_important_warning(self, panel, announcements):
+        panel.show_failed("out of memory")
+        text, important = announcements[-1]
+        assert text.startswith("Warning: ") and "out of memory" in text
+        assert important
+
+    def test_download_progress_is_spoken_now_and_then(self, panel, announcements):
+        panel.show_started()
+        panel.last_spoken = -app.ANNOUNCE_PROGRESS_EVERY
+        panel.show_progress("Downloading Phi-3.5-vision (2.6 GB)", 1 << 30, 2 << 30)
+        panel.show_progress("Downloading Phi-3.5-vision (2.6 GB)", 1 << 30, 2 << 30)
+        assert announcements[1:] == [("Downloading Phi-3.5-vision, 50 percent", False)]
+        assert panel.status.text() == \
+            "Downloading Phi-3.5-vision (2.6 GB): 1,024 / 2,048 MB"
+
+    def test_copy(self, qapp, panel, announcements):
+        panel.show_done("A cat.")
+        panel.copy_button.click()
+        assert qapp.clipboard().text() == "A cat."
+        assert announcements[-1] == ("Description copied", False)
+
+
+class TestDescriptionService:
+
+    def test_earlier_descriptions_need_no_model(self, service, photos, monkeypatch):
+        monkeypatch.setattr(app, "agree_to_download", lambda *a, **k: 1 / 0)
+        service.cache().put(photos[0], "Earlier.")
+        panel = app.DescriptionPanel()
+        assert service.start(photos[0], panel)
+        assert panel.text.toPlainText() == "Earlier."
+        assert service.runs == []
+
+    def test_declining_the_download(self, service, photos, monkeypatch):
+        monkeypatch.setattr(app, "agree_to_download", lambda *a, **k: False)
+        panel = app.DescriptionPanel()
+        assert not service.start(photos[0], panel)
+        assert service.runs == []
+        assert "not downloaded" in panel.status.text()
+
+    def test_agreeing_starts_the_preferred_build(self, service, photos, monkeypatch):
+        asked = []
+        monkeypatch.setattr(app, "agree_to_download",
+                            lambda parent, variant, **k: asked.append(variant) or True)
+        service.start(photos[0], app.DescriptionPanel())
+        assert asked == ["cuda"]
+        assert service.runs == [(photos[0], "cuda")]
+
+    def test_a_loaded_model_is_not_asked_about(self, service, photos, monkeypatch):
+        monkeypatch.setattr(app, "agree_to_download", lambda *a, **k: 1 / 0)
+        service.state["describer"] = type("D", (), {"variant": "cpu"})()
+        service.start(photos[0], app.DescriptionPanel())
+        assert service.runs == [(photos[0], "cpu")]
+
+    def test_gpu_failure_offers_the_cpu_build(self, service, photos, monkeypatch):
+        asked = []
+        monkeypatch.setattr(app, "agree_to_download", lambda parent, variant, **k:
+                            asked.append((variant, k)) or True)
+        panel = app.DescriptionPanel()
+        worker = app.DescribeWorker(service.state, photos[0], "cuda")
+        worker.view, worker.needs_cpu_model = panel, True
+        service.worker = worker
+        service.on_worker_done()
+        assert asked == [("cpu", {"gpu_failed": True})]
+        assert service.runs == [(photos[0], "cpu")]
+        assert service.cpu_only
+
+    def test_a_new_request_waits_for_the_last_to_stop(self, service, photos,
+                                                      monkeypatch):
+        monkeypatch.setattr(app, "agree_to_download", lambda *a, **k: True)
+        old, new = app.DescriptionPanel(), app.DescriptionPanel()
+        worker = app.DescribeWorker(service.state, photos[1], "cuda")
+        worker.view = old
+        service.worker = worker
+        service.start(photos[0], new)
+        assert worker.view is None          # Hears no more from the old one.
+        assert service.runs == []
+        service.on_worker_done()
+        assert service.runs == [(photos[0], "cuda")]
+
+
+class TestDownloadQuestion:
+
+    def test_gpu(self, monkeypatch):
+        monkeypatch.setattr(models, "nvidia_gpu", lambda: "Test GPU")
+        text, details = app.download_question("cuda", 2_600_000_000)
+        assert text == "Describing photos needs Phi-3.5-vision, a 2.6 GB download."
+        assert "graphics card (Test GPU)" in details
+        assert "not sent anywhere" in details
+
+    def test_cpu(self):
+        _, details = app.download_question("cpu", 3_200_000_000)
+        assert "half a minute" in details
+
+    def test_after_the_gpu_failed(self):
+        _, details = app.download_question("cpu", 3_200_000_000, gpu_failed=True)
+        assert details.startswith("It runs on this computer")
+        assert "could not run" in details
+
+    def test_not_enough_space(self, qapp, monkeypatch):
+        warned = []
+        monkeypatch.setattr(describe, "download_size", lambda v: 3_000_000_000)
+        monkeypatch.setattr(describe, "free_space", lambda: 2_000_000_000)
+        monkeypatch.setattr(app.QMessageBox, "warning",
+                            lambda parent, title, text: warned.append(text))
+        assert not app.agree_to_download(None, "cpu")
+        assert "only 2.0 GB free" in warned[0]
+
+    def test_nothing_to_download(self, monkeypatch):
+        monkeypatch.setattr(describe, "download_size", lambda v: 0)
+        assert app.agree_to_download(None, "cpu")
+
+
+class TestDescribeFromTheWindow:
+
+    def test_ctrl_d_describes_the_current_result(self, window, monkeypatch):
+        opened = []
+        monkeypatch.setattr(window, "enlarge",
+                            lambda item, describe_now=False: opened.append(
+                                (item.data(Qt.ItemDataRole.UserRole), describe_now)))
+        show(window, [("C:/p/a.jpg", {"text": 0.3}, b"", None)], prompt="dog")
+        assert window.describe_action.shortcut() == \
+            QKeySequence(app.DESCRIBE_SHORTCUT)
+        window.describe_action.trigger()
+        assert opened == [("C:/p/a.jpg", True)]
+
+    def test_progress_past_2_gb(self, window):
+        window.clock.start()
+        window.on_progress("Downloading model", 3 << 30, 4 << 30)
+        assert window.progress.value() == 750
+
+    def test_ctrl_d_without_results_says_why(self, window, announcements):
+        window.describe_action.trigger()
+        assert announcements[-1] == ("No photo to describe; search first", False)
+
+    def test_device_is_shown_once_a_model_has_loaded(self, window, monkeypatch):
+        monkeypatch.setattr(models, "device", lambda: "GPU (Test GPU)")
+        window.update_device()
+        assert window.device.text() == ""
+        window.state["clip"] = object()
+        window.update_device()
+        assert window.device.text() == "Running on GPU (Test GPU)"

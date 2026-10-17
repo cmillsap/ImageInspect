@@ -188,7 +188,8 @@ class FaceModel:
     """The SCRFD detector and ArcFace recognizer."""
 
     def __init__(self):
-        self._detector = models.create_session(DETECTOR)
+        # On CUDA it warns, harmlessly, that a few steps stay on the CPU.
+        self._detector = models.create_session(DETECTOR, quiet=True)
         # It declares a batch size of 1 but takes any, and onnxruntime
         # warns about that on every batch.
         self._recognizer = models.create_session(RECOGNIZER, quiet=True)

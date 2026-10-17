@@ -1,0 +1,8 @@
+# Runs the models on an NVIDIA GPU (Turing / RTX 20-series or newer, recent
+# driver), falling back to the CPU if it cannot. Pulls in the CUDA 13 and
+# cuDNN 9 libraries, about 1.6 GB. Uninstall onnxruntime and
+# onnxruntime-genai first if switching from requirements.txt; setup.bat
+# does this for you.
+-r requirements-base.txt
+onnxruntime-gpu[cuda,cudnn]==1.31.0
+onnxruntime-genai-cuda==0.18.0

@@ -1,13 +1,7 @@
-PyQt6==6.11.0
-Pillow==12.3.0
-# HEIC/HEIF decoding
-pillow-heif==1.8.1
-# DNG decoding via LibRaw
-rawpy==0.27.1
-numpy==2.5.4
-# Runs both halves of CLIP; the models are downloaded on first search
+# Runs everything on the CPU. For an NVIDIA GPU use requirements-cuda.txt
+# instead (setup.bat chooses for you); the two cannot be installed together.
+-r requirements-base.txt
+# Runs CLIP and the face models; they are downloaded on first use
 onnxruntime==1.31.0
-# CLIP's text tokenizer
-tokenizers==0.23.3
-# Tests: venv\Scripts\python -m pytest
-pytest==8.4.2
+# Runs the description model (Phi-3.5-vision), downloaded when first asked for
+onnxruntime-genai==0.18.0

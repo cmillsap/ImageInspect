@@ -5,7 +5,9 @@ such as "a dog on the beach", add one or more guide images that look like what
 you want, or combine the two, and the app shows thumbnails of the
 best-matching images (top 100 by default), ranked by
 [CLIP](https://openai.com/research/clip) similarity. Guide images can also
-pick out a person, found by face recognition. Click a thumbnail to enlarge it.
+pick out a person, found by face recognition. Click a thumbnail to enlarge it,
+and ask for a written description of the photo from a language model that runs
+on your computer.
 
 ## Searching
 
@@ -41,6 +43,25 @@ window.
 - Progress and *Cancel* are in the status bar, if indexing new files is
   taking too long.
 
+## Describing a photo
+
+Press *Describe* in a photo's enlarged view, choose *Describe image* from a
+result's menu, or press Ctrl+D on a result. The description is written beside
+the photo by [Phi-3.5-vision](https://huggingface.co/microsoft/Phi-3.5-vision-instruct-onnx),
+a small vision language model that runs on your computer, so photos are not
+sent anywhere. *Copy* puts it on the clipboard.
+
+- The first time, you are asked before the model is downloaded: 2.6 GB for an
+  NVIDIA graphics card or 3.2 GB for the processor, whichever this computer
+  will use. *Stop* or closing the view cancels the download; it carries on
+  from there next time.
+- With a recent NVIDIA card a description takes a few seconds; on the
+  processor, about half a minute (on a Ryzen 7 9700X: 2-3 s on an RTX 5060 Ti
+  against 25-30 s). The model stays loaded until the app closes.
+- Descriptions are remembered, so asking again is instant until the photo
+  changes.
+- Like any such model it can get details wrong; it often miscounts people.
+
 *Things & scenes* matches overall content and style well but does not
 recognise individuals: guide photos of a person find similar scenes, clothes
 and poses. Use *Person* for that.
@@ -58,6 +79,7 @@ reader such as NVDA or Narrator reads out.
 | Esc | Cancel a search |
 | Alt + underlined letter | Move to that control (e.g. Alt+D for Description) |
 | Enter on a result | Enlarge it |
+| Ctrl+D on a result or in the enlarged view | Describe the photo |
 | Menu key or Shift+F10 on a result or guide | Its menu (*Find similar*, *Find this person*, …) |
 | Delete on a guide | Remove it |
 
@@ -65,7 +87,9 @@ Results and guides are read with their file name, scores, and where in the
 photo the matching face is; the face picker names each person by their place
 in the photo, left to right. Screen readers also hear what happens away from
 the focus: guides added or removed, indexing progress (every 15 seconds or
-so), the results, and warnings such as a guide with no face.
+so), the results, and warnings such as a guide with no face. A photo's
+description is read out once it is written, and stays in the enlarged view's
+*Description* box to review.
 
 The window follows the Windows light or dark theme, high contrast, and the
 *Accessibility > Text size* setting (read at start-up, so restart the app
@@ -79,11 +103,17 @@ copied from that project).
 ## Setup
 
 ```powershell
-py -3.12 -m venv venv
-venv\Scripts\pip install -r requirements.txt
-run.bat                       # or: venv\Scripts\python app.py
+setup.bat                      # creates venv and installs the packages
+run.bat                        # or: venv\Scripts\python app.py
 venv\Scripts\python -m pytest  # run the tests (no models needed)
 ```
+
+`setup.bat` installs the NVIDIA GPU (CUDA) build of onnxruntime if the
+computer has an NVIDIA driver (`requirements-cuda.txt`, which brings about
+1.6 GB of CUDA and cuDNN libraries with it) and the CPU build otherwise
+(`requirements.txt`). `setup.bat cpu` or `setup.bat cuda` chooses for itself,
+and running it again switches. The two builds cannot be installed side by
+side.
 
 ## How it works
 
@@ -115,8 +145,21 @@ venv\Scripts\python -m pytest  # run the tests (no models needed)
 - **Licence:** the InsightFace pretrained models are for non-commercial
   research use only; see
   [InsightFace's licence](https://github.com/deepinsight/insightface#license).
-- All models run through onnxruntime on the CPU. `models.py` creates every
-  session and prefers a GPU when the installed onnxruntime offers one, so
-  swapping `onnxruntime` for `onnxruntime-directml` (any DirectX 12 GPU) or
-  `onnxruntime-gpu` (NVIDIA CUDA) in `requirements.txt` should be all that
-  GPU acceleration needs. That has not been tested yet.
+- Descriptions use the int4-quantised ONNX builds of Phi-3.5-vision-instruct
+  (MIT licence), run by onnxruntime-genai (`describe.py`). The photo is
+  turned upright and scaled to 1344 px first, which is as much as the model
+  sees, and goes through the app's own decoder, so HEIC and DNG work too.
+  Descriptions are cached in `index.sqlite`.
+- **GPU:** `models.py` chooses the hardware for every model. With the CUDA
+  build installed and an NVIDIA GPU of the Turing generation (RTX 20-series)
+  or newer, everything runs on the GPU: on an RTX 5060 Ti, CLIP indexes about
+  ten times faster than on a Ryzen 7 9700X and finding faces about five times
+  faster, with the same results. If CUDA cannot be used after all,
+  onnxruntime quietly falls back to the CPU; the app notices, carries on on
+  the CPU, and the status bar says which is in use and why (e.g. *Running on
+  GPU (NVIDIA GeForce RTX 5060 Ti)*). Should only the description model's
+  GPU build fail to load, the CPU build is offered instead. DirectML (AMD and
+  Intel GPUs) is not supported: onnxruntime-genai's DirectML build lags well
+  behind and needs an older onnxruntime.
+- Downloads resume where they stopped and are checked against pinned
+  SHA-256 hashes.
