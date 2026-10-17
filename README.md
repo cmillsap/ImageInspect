@@ -9,6 +9,29 @@ pick out a person, found by face recognition. Click a thumbnail to enlarge it,
 and ask for a written description of the photo from a language model that runs
 on your computer.
 
+## Install
+
+Download an installer from the
+[latest release](https://github.com/cmillsap/ImageInspect/releases/latest)
+and run it. Python is not needed.
+
+- **ImageInspect-x.y.z-GPU-Setup.exe** if the computer has an NVIDIA
+  graphics card (RTX 20-series or newer): models run on the card, and a photo
+  is described in seconds rather than half a minute. It is large because it
+  carries NVIDIA's CUDA libraries.
+- **ImageInspect-x.y.z-Setup.exe** otherwise. Everything works, on the
+  processor.
+
+Either installs over the other, and over an earlier version. It installs for
+the current user, with no UAC prompt; choose *Install for all users* on the
+first page to put it in Program Files instead. The models are downloaded the
+first time each feature is used. Uninstalling asks whether to delete the
+search index and downloaded models too.
+
+The installers are not code-signed, so SmartScreen says "Windows protected
+your PC" the first time: click *More info*, then *Run anyway*. Requires 64-bit
+Windows 10 or later.
+
 ## Searching
 
 The sidebar on the left holds the search; results fill the rest of the
@@ -114,6 +137,22 @@ computer has an NVIDIA driver (`requirements-cuda.txt`, which brings about
 (`requirements.txt`). `setup.bat cpu` or `setup.bat cuda` chooses for itself,
 and running it again switches. The two builds cannot be installed side by
 side.
+
+## Building the installers
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\build.ps1               # both
+powershell -ExecutionPolicy Bypass -File packaging\build.ps1 -Variant cpu  # or one
+```
+
+Needs Python 3.12 (`py -3.12`) and Inno Setup 6
+(`winget install JRSoftware.InnoSetup`). For each variant it makes a build
+venv under `build\`, runs the tests, freezes the app with PyInstaller and
+packs it with Inno Setup into `dist\`. The version comes from `version.py`.
+
+`ImageInspect.exe --diagnose photo.jpg report.txt` checks that each
+downloaded model loads and runs on the photo, and on which hardware, writing
+the result to `report.txt`; useful as the installed app has no console.
 
 ## How it works
 

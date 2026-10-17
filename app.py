@@ -31,11 +31,17 @@ import describe
 import face_search
 import models
 from image_io import open_image
+from version import __version__
 from ui_support import (THEME_CHANGE, HintLabel, StatusLabel, WidestTextLabel,
                         WrapLabel, announce, apply_windows_appearance,
                         initial_window_rect, make_secondary,
                         refresh_scaled_fonts, scale_font,
                         secondary_text_color, set_tone)
+
+# Where bundled files are: next to this file, or in the installed app's
+# _internal folder.
+BUNDLE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+APP_ICON = os.path.join(BUNDLE_DIR, "packaging", "icon.ico")
 
 ICON_SIZE = clip_search.THUMB_SIZE * 3 // 4
 GUIDE_ICON_SIZE = 64
@@ -1499,8 +1505,15 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    if len(sys.argv) >= 3 and sys.argv[1] == "--diagnose":
+        import diagnose
+        diagnose.run(sys.argv[2], sys.argv[3] if len(sys.argv) > 3
+                     else "diagnose.txt")
+        return
     app = QApplication(sys.argv)
     app.setApplicationName("ImageInspect")
+    app.setApplicationVersion(__version__)
+    app.setWindowIcon(QIcon(APP_ICON))
     apply_windows_appearance(app)
     window = MainWindow()
     window.show()
