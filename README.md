@@ -1,6 +1,6 @@
 # Image Inspect
 
-Search a folder of photos by description, by example, or both. Type a prompt
+Search folders of photos by description, by example, or both. Type a prompt
 such as "a dog on the beach", add one or more guide images that look like what
 you want, or combine the two, and the app shows thumbnails of the
 best-matching images (top 100 by default), ranked by
@@ -37,8 +37,13 @@ Windows 10 or later.
 The sidebar on the left holds the search; results fill the rest of the
 window.
 
-- **Folder:** type or pick a folder; the list remembers the last ten
-  searched, and *…* browses for another.
+- **Folders:** the folders to search, which can be anywhere: other drives,
+  USB disks, network shares. *+* adds one (its arrow lists recently searched
+  folders), as does dropping a folder on the window; *−* or Delete removes the
+  selected one. Untick a folder to leave it out without forgetting it. The
+  list is remembered between sessions. A folder that cannot be reached, such
+  as an unplugged drive, is skipped and noted in the results summary.
+  Folders inside one another are fine: each photo is listed once.
 - **Search for:** *Things & scenes* matches what images look like (CLIP);
   *Person* finds photos of the person in the guide photos (face recognition).
 - **Description:** what you are looking for, e.g. "a dog on the beach". Press
@@ -96,9 +101,11 @@ reader such as NVDA or Narrator reads out.
 
 | Key | Action |
 | --- | --- |
-| Ctrl+O | Choose the folder to search |
+| Ctrl+O | Add a folder to search |
 | Ctrl+Shift+O | Add guide images |
-| Enter (in the folder or description) or Ctrl+Enter | Search |
+| Enter (in the description) or Ctrl+Enter | Search |
+| Space on a folder | Tick or untick it |
+| Delete on a folder | Remove it |
 | Esc | Cancel a search |
 | Alt + underlined letter | Move to that control (e.g. Alt+D for Description) |
 | Enter on a result | Enlarge it |

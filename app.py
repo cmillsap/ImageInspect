@@ -1,8 +1,9 @@
 """
 Image Inspect
 
-Pick a folder, then describe what you are looking for, add guide images
-that look like it, or both, and see the images CLIP thinks match best.
+Pick the folders to search, then describe what you are looking for, add
+guide images that look like it, or both, and see the images CLIP thinks
+match best.
 Guide images can instead pick out a person, matched by face recognition.
 Click a thumbnail to enlarge it; right-click it to search for similar ones
 or have a local language model describe it.
@@ -18,7 +19,7 @@ from PyQt6.QtCore import (QElapsedTimer, QEvent, QObject, QPoint, QSettings,
 from PyQt6.QtGui import (QAction, QColor, QContextMenuEvent, QDesktopServices,
                          QIcon, QImage, QKeySequence, QPainter, QPalette,
                          QPixmap)
-from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
+from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox,
                              QDialog, QFileDialog, QFrame, QGridLayout,
                              QHBoxLayout, QLabel, QLineEdit, QListWidget,
                              QListWidgetItem, QMainWindow, QMenu, QMessageBox,
@@ -90,7 +91,9 @@ def path_key(path):
 
 
 class SearchWorker(QThread):
-    """Downloads models if needed, indexes the folder, then ranks it.
+    """Downloads models if needed, indexes the folders, then ranks them.
+
+    Folders that cannot be read are skipped and listed in unreachable.
 
     For a person search, the guide images' faces are found first. Guides
     whose face is not yet known are reported through guide_faces; if any
@@ -103,11 +106,12 @@ class SearchWorker(QThread):
     failed = pyqtSignal(str)
     guide_faces = pyqtSignal(list)      # [(path, [face_search.Face])]
 
-    def __init__(self, state, folder, recursive, prompt, guides, image_weight,
+    def __init__(self, state, folders, recursive, prompt, guides, image_weight,
                  limit, match=MATCH_LOOK, known_faces=None, threshold=0.0):
         super().__init__()
         self.state = state              # dict holding the models and indexes
-        self.folder, self.recursive = folder, recursive
+        self.folders, self.recursive = list(folders), recursive
+        self.unreachable = []
         self.prompt, self.guides = prompt, guides
         self.image_weight, self.limit = image_weight, limit
         self.match, self.threshold = match, threshold
@@ -130,8 +134,12 @@ class SearchWorker(QThread):
                 if template is None:
                     return
 
-            self.progress.emit("Scanning folder", 0, 0)
-            paths = clip_search.find_images(self.folder, self.recursive)
+            paths, self.unreachable = clip_search.find_images_in(
+                self.folders, self.recursive, self.progress.emit)
+            if len(self.unreachable) == len(self.folders):
+                self.failed.emit("None of the folders could be reached:\n"
+                                 + "\n".join(self.unreachable))
+                return
             index.build(clip, paths, self.progress.emit,
                         self.isInterruptionRequested)
 
@@ -725,7 +733,7 @@ class FacePickerDialog(QDialog):
 # Window-wide keys for the main actions. Each presses its button, so a key
 # does nothing a click could not.
 SHORTCUTS = {
-    "choose_folder": ["Ctrl+O"],
+    "add_folder": ["Ctrl+O"],
     "add_guides": ["Ctrl+Shift+O"],
     "search": ["Ctrl+Return", "Ctrl+Enter"],
     "cancel": ["Esc"],
@@ -772,24 +780,45 @@ class MainWindow(QMainWindow):
         self.guide_faces = {}
         self.pending_choices = []           # [(path, faces)] to ask about
 
-        # Folder
-        self.folder = QComboBox()
-        self.folder.setEditable(True)
-        self.folder.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.folder.setSizeAdjustPolicy(
-            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.folder.setMinimumContentsLength(10)
-        self.folder.lineEdit().setPlaceholderText("Folder of images")
-        self.folder.addItems(self.recent_folders())
-        self.folder.setCurrentText(self.settings.value("folder", ""))
-        self.folder.lineEdit().returnPressed.connect(self.search)
-        self.folder.setToolTip("The folder to search; recent folders are in the list")
-        folder_heading = heading("&Folder", self.folder, "Folder to search")
-        self.browse_button = QToolButton()
-        self.browse_button.setText("…")
-        self.browse_button.setAccessibleName("Choose folder")
-        self.browse_button.setToolTip("Choose a folder")
-        self.browse_button.clicked.connect(self.choose_folder)
+        # Folders: each ticked one is searched, so a folder can sit out a
+        # search without being forgotten.
+        self.folder_list = ThumbnailList()
+        self.folder_list.setViewMode(QListWidget.ViewMode.ListMode)
+        # Rows as wide as the list, so a long path is shortened in the
+        # middle, keeping its drive and last folder, rather than scrolling.
+        self.folder_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self.folder_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.folder_row = 0                 # row height, set in apply_metrics
+        self.folder_list.set_hint("Press + to add a folder of images, "
+                                  "or drop one here")
+        self.folder_list.menu_requested.connect(self.folder_menu)
+        self.folder_list.currentItemChanged.connect(self.update_controls)
+        remove = QAction(self.folder_list)
+        remove.setShortcuts([QKeySequence(QKeySequence.StandardKey.Delete),
+                             QKeySequence(Qt.Key.Key_Backspace)])
+        remove.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+        remove.triggered.connect(self.remove_current_folder)
+        self.folder_list.addAction(remove)
+        folder_heading = heading("&Folders", self.folder_list, "Folders to search")
+        self.add_folder_button = QToolButton()
+        self.add_folder_button.setText("+")
+        self.add_folder_button.setAccessibleName("Add folder")
+        self.add_folder_button.setToolTip("Add a folder; the arrow lists "
+                                          "recent folders")
+        self.add_folder_button.clicked.connect(self.choose_folder)
+        self.recent_menu = QMenu(self.add_folder_button)
+        self.recent_menu.aboutToShow.connect(self.fill_recent_menu)
+        self.add_folder_button.setMenu(self.recent_menu)
+        self.add_folder_button.setPopupMode(
+            QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self.remove_folder_button = QToolButton()
+        self.remove_folder_button.setText("\u2212")
+        self.remove_folder_button.setAccessibleName("Remove folder")
+        self.remove_folder_button.setToolTip("Remove the selected folder")
+        self.remove_folder_button.clicked.connect(self.remove_current_folder)
+        self.load_folders()
+        self.folder_list.itemChanged.connect(self.save_folders)
         self.recursive = QCheckBox("Include s&ubfolders")
         self.recursive.setChecked(self.settings.value("recursive", True, bool))
 
@@ -883,7 +912,7 @@ class MainWindow(QMainWindow):
         self.results.menu_requested.connect(self.result_menu)
 
         # Status bar
-        self.status = QLabel("Choose a folder, then enter a description or "
+        self.status = QLabel("Add a folder, then enter a description or "
                              "add guide images.")
         self.status.setIndent(self.fontMetrics().averageCharWidth())
         self.progress = QProgressBar()
@@ -904,9 +933,10 @@ class MainWindow(QMainWindow):
         bar.addPermanentWidget(self.device)
 
         # Sidebar layout
-        folder_row = QHBoxLayout()
-        folder_row.addWidget(self.folder, 1)
-        folder_row.addWidget(self.browse_button)
+        folder_head = QHBoxLayout()
+        folder_head.addWidget(folder_heading, 1)
+        folder_head.addWidget(self.add_folder_button)
+        folder_head.addWidget(self.remove_folder_button)
         mode_row = QHBoxLayout()
         mode_row.addWidget(self.look_button)
         mode_row.addWidget(self.person_button)
@@ -929,8 +959,8 @@ class MainWindow(QMainWindow):
         self.sidebar = QWidget()
         side = QVBoxLayout(self.sidebar)
         self.gaps = []
-        side.addWidget(folder_heading)
-        side.addLayout(folder_row)
+        side.addLayout(folder_head)
+        side.addWidget(self.folder_list)
         side.addWidget(self.recursive)
         self.add_gap(side)
         side.addWidget(heading("Search for"))
@@ -986,7 +1016,7 @@ class MainWindow(QMainWindow):
         self.gaps.append(gap)
 
     def build_shortcuts(self):
-        buttons = {"choose_folder": self.browse_button,
+        buttons = {"add_folder": self.add_folder_button,
                    "add_guides": self.add_guide_button,
                    "search": self.search_button,
                    "cancel": self.cancel_button}
@@ -1020,6 +1050,15 @@ class MainWindow(QMainWindow):
                                        + scroll_bar)
         self.sidebar.layout().setContentsMargins(0, 0, scroll_bar, 0)
         self.sidebar.layout().invalidate()
+        # Room for four folders before the list scrolls, measured on a
+        # stand-in row since the list may be empty.
+        probe = self.add_folder_item("X")
+        self.folder_row = self.folder_list.sizeHintForRow(self.folder_list.row(probe))
+        self.folder_list.takeItem(self.folder_list.row(probe))
+        for i in range(self.folder_list.count()):
+            self.folder_list.item(i).setSizeHint(QSize(1, self.folder_row))
+        self.folder_list.setFixedHeight(4 * self.folder_row
+                                        + 2 * self.folder_list.frameWidth())
         # Room for two rows of guides before the list scrolls.
         self.guide_list.setFixedHeight(2 * (GUIDE_ICON_SIZE + 16) + 8)
         # A fixed cell with room for two lines of label under each icon.
@@ -1041,17 +1080,110 @@ class MainWindow(QMainWindow):
         folders = self.settings.value("recent_folders", [], list)
         return [f for f in folders if isinstance(f, str) and f]
 
-    def remember_folder(self, folder):
-        folders = [folder] + [f for f in self.recent_folders()
-                              if not same_path(f, folder)]
-        folders = folders[:self.RECENT_FOLDERS]
-        self.settings.setValue("recent_folders", folders)
-        self.settings.setValue("folder", folder)
-        self.folder.blockSignals(True)
-        self.folder.clear()
-        self.folder.addItems(folders)
-        self.folder.setCurrentText(folder)
-        self.folder.blockSignals(False)
+    def remember_folders(self, folders):
+        """Put folders at the top of the recent list, in order."""
+        recent = list(folders) + [f for f in self.recent_folders()
+                                  if not any(same_path(f, g) for g in folders)]
+        self.settings.setValue("recent_folders", recent[:self.RECENT_FOLDERS])
+
+    # ------------------------------------------------------------------
+    # Folders
+    # ------------------------------------------------------------------
+
+    def folders(self, ticked_only=False):
+        items = [self.folder_list.item(i) for i in range(self.folder_list.count())]
+        return [item.data(Qt.ItemDataRole.UserRole) for item in items
+                if not ticked_only or item.checkState() == Qt.CheckState.Checked]
+
+    def load_folders(self):
+        if self.settings.contains("folders"):
+            folders = self.settings.value("folders", [], list)
+        else:
+            # Settings from before several folders could be searched.
+            folders = [self.settings.value("folder", "")]
+        unticked = self.settings.value("unticked_folders", [], list)
+        for folder in folders:
+            if isinstance(folder, str) and folder:
+                self.add_folder_item(folder, folder not in unticked)
+
+    def save_folders(self):
+        ticked = self.folders(ticked_only=True)
+        self.settings.setValue("folders", self.folders())
+        self.settings.setValue("unticked_folders",
+                               [f for f in self.folders() if f not in ticked])
+
+    def add_folder_item(self, folder, ticked=True):
+        item = QListWidgetItem(folder)
+        item.setData(Qt.ItemDataRole.UserRole, folder)
+        item.setToolTip(f"{folder}\n(untick to leave it out of the search; "
+                        "press Delete to remove it)")
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Checked if ticked
+                           else Qt.CheckState.Unchecked)
+        if self.folder_row:
+            item.setSizeHint(QSize(1, self.folder_row))
+        self.folder_list.blockSignals(True)
+        self.folder_list.addItem(item)
+        self.folder_list.blockSignals(False)
+        return item
+
+    def folder_item(self, folder):
+        for i in range(self.folder_list.count()):
+            item = self.folder_list.item(i)
+            if same_path(item.data(Qt.ItemDataRole.UserRole), folder):
+                return item
+        return None
+
+    def add_folders(self, folders):
+        """Add folders, ticked; one already listed is ticked instead."""
+        added = []
+        for folder in folders:
+            folder = os.path.normpath(os.path.abspath(folder))
+            item = self.folder_item(folder)
+            if item is not None:
+                item.setCheckState(Qt.CheckState.Checked)
+            else:
+                item = self.add_folder_item(folder)
+                added.append(folder)
+            self.folder_list.setCurrentItem(item)
+        self.save_folders()
+        if len(added) == 1:
+            announce(self, f"Folder {added[0]} added, "
+                     f"{self.folder_list.count()} in all")
+        elif added:
+            announce(self, f"{len(added)} folders added, "
+                     f"{self.folder_list.count()} in all")
+        self.update_controls()
+
+    def remove_folder(self, folder):
+        item = self.folder_item(folder)
+        if item is not None:
+            self.folder_list.takeItem(self.folder_list.row(item))
+            announce(self, f"Removed folder {folder}")
+        self.save_folders()
+        self.update_controls()
+
+    def remove_current_folder(self):
+        item = self.folder_list.currentItem()
+        if item is not None and self.worker is None:
+            self.remove_folder(item.data(Qt.ItemDataRole.UserRole))
+
+    def fill_recent_menu(self):
+        self.recent_menu.clear()
+        recent = [f for f in self.recent_folders() if self.folder_item(f) is None]
+        for folder in recent:
+            self.recent_menu.addAction(folder.replace("&", "&&"),
+                                       lambda f=folder: self.add_folders([f]))
+        if not recent:
+            self.recent_menu.addAction("No other recent folders").setEnabled(False)
+
+    def folder_menu(self, item, pos):
+        if item is None or self.worker is not None:
+            return
+        menu = QMenu(self)
+        menu.addAction("&Remove", lambda: self.remove_folder(
+            item.data(Qt.ItemDataRole.UserRole)))
+        menu.exec(pos)
 
     # ------------------------------------------------------------------
     # Guide images
@@ -1141,7 +1273,7 @@ class MainWindow(QMainWindow):
         # folder being searched.
         start = self.settings.value("guide_folder", "")
         if not os.path.isdir(start):
-            start = self.folder.currentText()
+            start = next(iter(self.folders(ticked_only=True) or self.folders()), "")
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Choose guide images", start,
             f"Images ({patterns});;All files (*)")
@@ -1201,6 +1333,9 @@ class MainWindow(QMainWindow):
 
     def dropEvent(self, event):
         paths = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
+        folders = [p for p in paths if os.path.isdir(p)]
+        if folders:
+            self.add_folders(folders)
         self.add_guides([p for p in paths if os.path.splitext(p)[1].lower()
                          in clip_search.IMAGE_EXTENSIONS])
 
@@ -1224,6 +1359,8 @@ class MainWindow(QMainWindow):
         self.guide_list.set_hint(
             "Drop photos of the person here, or press + to choose them"
             if person else "Drop images here, or press + to choose them (optional)")
+        self.remove_folder_button.setEnabled(
+            self.folder_list.currentItem() is not None)
         self.clear_guides_button.setEnabled(has_guides)
         self.guide_hint.setVisible(has_guides)
         self.update_guide_items()
@@ -1261,10 +1398,12 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def choose_folder(self):
+        item = self.folder_list.currentItem()
+        start = item.data(Qt.ItemDataRole.UserRole) if item else ""
         folder = QFileDialog.getExistingDirectory(
-            self, "Choose image folder", self.folder.currentText())
+            self, "Add a folder of images", start)
         if folder:
-            self.folder.setCurrentText(os.path.normpath(folder))
+            self.add_folders([folder])
 
     def cancel(self):
         if self.worker is not None and not self.worker.isInterruptionRequested():
@@ -1277,15 +1416,22 @@ class MainWindow(QMainWindow):
     def search(self):
         if self.worker is not None:
             return
-        folder = self.folder.currentText().strip()
+        folders = self.folders(ticked_only=True)
         prompt = self.prompt_edit.text().strip()
         guides = self.guides()
-        if not os.path.isdir(folder):
-            QMessageBox.warning(self, "Image Inspect", "Choose a folder of images first.")
+        if not folders:
+            QMessageBox.warning(self, "Image Inspect",
+                                "Tick at least one folder to search."
+                                if self.folder_list.count()
+                                else "Add a folder of images first.")
+            return
+        if not any(os.path.isdir(f) for f in folders):
+            QMessageBox.warning(self, "Image Inspect",
+                                "None of the ticked folders could be found.")
             return
         if not guides and (self.person_mode() or not prompt):
             return
-        self.remember_folder(os.path.normpath(folder))
+        self.remember_folders(folders)
         self.settings.setValue("recursive", self.recursive.isChecked())
         self.settings.setValue("image_weight", self.weight.value())
         self.settings.setValue("match", MATCH_PERSON if self.person_mode()
@@ -1297,7 +1443,7 @@ class MainWindow(QMainWindow):
         # search has started even if indexing new files takes a while.
         self.results.clear()
         self.summary.set_status("Searching…")
-        self.worker = SearchWorker(self.state, folder, self.recursive.isChecked(),
+        self.worker = SearchWorker(self.state, folders, self.recursive.isChecked(),
                                    prompt, guides, self.weight.value() / 100,
                                    self.limit.value(),
                                    MATCH_PERSON if self.person_mode() else MATCH_LOOK,
@@ -1398,6 +1544,9 @@ class MainWindow(QMainWindow):
                        else f"The best {len(results)} {noun} of the person")
         else:
             summary = f"The best {len(results)} of {count:,} images"
+            searched = len(worker.folders) - len(worker.unreachable)
+            if searched > 1:
+                summary += f" in {searched} folders"
         if worker.prompt:
             summary += f" matching “{worker.prompt}”"
         notes = []
@@ -1407,9 +1556,13 @@ class MainWindow(QMainWindow):
             if no_face:
                 notes.append(f"{no_face} guide photo{'s' if no_face > 1 else ''} "
                              "with no face ignored")
+        if len(worker.unreachable) == 1:
+            notes.append(f"{worker.unreachable[0]} could not be reached")
+        elif worker.unreachable:
+            notes.append(f"{len(worker.unreachable)} folders could not be reached")
         if worker.isInterruptionRequested():
-            notes.append("indexing was cancelled, so only part of the folder "
-                         "was searched")
+            notes.append("indexing was cancelled, so only some of the images "
+                         "were searched")
         if notes:
             self.summary.set_status(f"{summary} ({'; '.join(notes)})", "problem")
         else:

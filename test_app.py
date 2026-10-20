@@ -84,8 +84,10 @@ class FakeWorker:
     """Enough of a finished SearchWorker for show_results."""
 
     def __init__(self, guides=(), match=app.MATCH_LOOK, prompt="",
-                 known_faces=None, limit=100, cancelled=False):
+                 known_faces=None, limit=100, cancelled=False,
+                 folders=("C:/p",), unreachable=()):
         self.guides, self.match, self.prompt = list(guides), match, prompt
+        self.folders, self.unreachable = list(folders), list(unreachable)
         self.known_faces = known_faces or {}
         self.limit, self.cancelled = limit, cancelled
         self.needs_choice = False
@@ -143,7 +145,8 @@ class TestScreenReaders:
         assert len(names) == len(set(names))
 
     def test_symbol_buttons_are_named_in_words(self, window):
-        assert window.browse_button.accessibleName() == "Choose folder"
+        assert window.add_folder_button.accessibleName() == "Add folder"
+        assert window.remove_folder_button.accessibleName() == "Remove folder"
         assert window.add_guide_button.accessibleName() == "Add guide images"
 
     def test_names_follow_the_mode(self, window):
@@ -332,7 +335,7 @@ class TestAnnouncements:
 
 def tab_stops(window):
     """Visible widgets that Tab lands on, in the order it visits them."""
-    start = window.folder
+    start = window.add_folder_button
     stops, widget = [], start
     while True:
         if widget.isVisible() and (widget.focusPolicy()
@@ -355,7 +358,8 @@ class TestKeyboard:
         window.add_guides(photos[:1])
         window.show()
         settle(qapp)
-        expected = [window.folder, window.browse_button, window.recursive,
+        expected = [window.add_folder_button, window.remove_folder_button,
+                    window.folder_list, window.recursive,
                     window.look_button, window.person_button,
                     window.prompt_edit, window.add_guide_button,
                     window.guide_list, window.clear_guides_button,
@@ -375,15 +379,15 @@ class TestKeyboard:
             assert bound == [QKeySequence(k) for k in keys]
 
     def test_tooltips_mention_the_shortcut(self, window):
-        assert "Ctrl+O" in window.browse_button.toolTip()
+        assert "Ctrl+O" in window.add_folder_button.toolTip()
         assert "Ctrl+Shift+O" in window.add_guide_button.toolTip()
         assert "Ctrl+Return" in window.search_button.toolTip()
 
-    def test_choose_folder_shortcut(self, window, monkeypatch):
+    def test_add_folder_shortcut(self, window, monkeypatch):
         opened = []
         monkeypatch.setattr(QFileDialog, "getExistingDirectory",
                             lambda *a, **k: opened.append(a) or "")
-        window.shortcut_actions["choose_folder"].trigger()
+        window.shortcut_actions["add_folder"].trigger()
         assert opened
 
     def test_add_guides_shortcut(self, window, monkeypatch):
@@ -451,6 +455,124 @@ class TestKeyboard:
         for label in window.findChildren(QLabel):
             if mnemonic(label.text()):
                 assert label.buddy() is not None, label.text()
+
+
+# ============================================================================
+# Folders
+# ============================================================================
+
+@pytest.fixture
+def folders(tmp_path):
+    """Two folders to search."""
+    made = []
+    for name in ("Photos", "Scans"):
+        folder = tmp_path / name
+        folder.mkdir()
+        made.append(str(folder))
+    return made
+
+
+def tick(window, folder, ticked):
+    window.folder_item(folder).setCheckState(
+        Qt.CheckState.Checked if ticked else Qt.CheckState.Unchecked)
+
+
+class TestFolders:
+
+    def test_adding_is_announced_and_ticked(self, window, folders, announcements):
+        window.add_folders(folders[:1])
+        assert window.folders(ticked_only=True) == folders[:1]
+        assert announcements[-1] == (f"Folder {folders[0]} added, 1 in all", False)
+        window.add_folders(folders)
+        assert announcements[-1] == (f"Folder {folders[1]} added, 2 in all", False)
+
+    def test_adding_a_listed_folder_ticks_it(self, window, folders):
+        window.add_folders(folders)
+        tick(window, folders[0], False)
+        window.add_folders([folders[0].upper()])
+        assert window.folders(ticked_only=True) == folders
+
+    def test_removing(self, window, folders, announcements):
+        window.add_folders(folders)
+        window.folder_list.setCurrentRow(0)
+        assert window.remove_folder_button.isEnabled()
+        window.remove_folder_button.click()
+        assert window.folders() == folders[1:]
+        assert announcements[-1] == (f"Removed folder {folders[0]}", False)
+
+    def test_list_is_remembered_with_its_ticks(self, qapp, settings, folders):
+        first = MainWindow(settings)
+        first.add_folders(folders)
+        tick(first, folders[1], False)
+        first.close()
+        again = MainWindow(settings)
+        assert again.folders() == folders
+        assert again.folders(ticked_only=True) == folders[:1]
+        again.close()
+
+    def test_single_folder_setting_carries_over(self, qapp, settings, folders):
+        settings.setValue("folder", folders[0])
+        w = MainWindow(settings)
+        assert w.folders(ticked_only=True) == folders[:1]
+        w.close()
+
+    def test_recent_menu_offers_folders_not_listed(self, window, folders):
+        window.settings.setValue("recent_folders", folders)
+        window.add_folders(folders[:1])
+        window.fill_recent_menu()
+        offered = [a.text() for a in window.recent_menu.actions()]
+        assert offered == [folders[1]]
+        window.recent_menu.actions()[0].trigger()
+        assert window.folders() == folders
+
+    def test_search_takes_the_ticked_folders(self, window, folders, monkeypatch):
+        started = []
+
+        class Worker(FakeWorker):
+            def __init__(self, state, searched, *args):
+                super().__init__()
+                started.append(searched)
+                self.progress = self.guide_faces = self.finished_ok = \
+                    self.failed = self.finished = type(
+                        "S", (), {"connect": lambda s, f: None})()
+
+            def start(self):
+                pass
+
+        monkeypatch.setattr(app, "SearchWorker", Worker)
+        window.add_folders(folders)
+        tick(window, folders[0], False)
+        window.prompt_edit.setText("dog")
+        window.search()
+        assert started == [folders[1:]]
+        assert window.recent_folders()[0] == folders[1]
+        window.worker = None
+
+    def test_nothing_ticked_says_why(self, window, folders, monkeypatch):
+        warned = []
+        monkeypatch.setattr(app.QMessageBox, "warning",
+                            lambda parent, title, text: warned.append(text))
+        window.prompt_edit.setText("dog")
+        window.search()
+        window.add_folders(folders[:1])
+        tick(window, folders[0], False)
+        window.search()
+        assert warned == ["Add a folder of images first.",
+                          "Tick at least one folder to search."]
+        assert window.worker is None
+
+    def test_summary_counts_the_folders(self, window, announcements):
+        show(window, [("C:/p/a.jpg", {"text": 0.3}, b"", None)], prompt="dog",
+             folders=["C:/p", "D:/q"])
+        assert announcements[-1] == (
+            "The best 1 of 50 images in 2 folders matching \u201cdog\u201d", True)
+
+    def test_unreachable_folder_is_a_warning(self, window, announcements):
+        show(window, [("C:/p/a.jpg", {"text": 0.3}, b"", None)], prompt="dog",
+             folders=["C:/p", "D:/q"], unreachable=["D:/q"])
+        text, important = announcements[-1]
+        assert text.startswith("Warning: ") and "D:/q could not be reached" in text
+        assert important
 
 
 # ============================================================================

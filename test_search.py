@@ -1,7 +1,10 @@
 """
-Tests for ranking and face bookkeeping that need no model: combining scores,
-the person cut-off, per-photo best faces, and the alignment geometry.
+Tests for ranking and face bookkeeping that need no model: finding images
+across folders, combining scores, the person cut-off, per-photo best faces,
+and the alignment geometry.
 """
+
+import os
 
 import numpy as np
 import pytest
@@ -14,6 +17,54 @@ import face_search
 def unit(*values):
     v = np.array(values, np.float32)
     return v / np.linalg.norm(v)
+
+
+@pytest.fixture
+def tree(tmp_path):
+    """Photos/a.jpg, Photos/2023/b.jpg and Scans/c.png."""
+    for name in ("Photos/a.jpg", "Photos/2023/b.jpg", "Scans/c.png",
+                 "Scans/notes.txt"):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"")
+    return tmp_path
+
+
+def names(paths):
+    return sorted(os.path.basename(p) for p in paths)
+
+
+class TestFindImagesIn:
+
+    def test_several_folders(self, tree):
+        paths, unreachable = clip_search.find_images_in(
+            [str(tree / "Photos"), str(tree / "Scans")], True)
+        assert names(paths) == ["a.jpg", "b.jpg", "c.png"]
+        assert unreachable == []
+
+    def test_subfolders_only_when_asked(self, tree):
+        paths, _ = clip_search.find_images_in(
+            [str(tree / "Photos"), str(tree / "Scans")], False)
+        assert names(paths) == ["a.jpg", "c.png"]
+
+    def test_overlapping_folders_list_each_file_once(self, tree):
+        paths, _ = clip_search.find_images_in(
+            [str(tree / "Photos"), str(tree / "Photos" / "2023"),
+             str(tree / "PHOTOS")], True)
+        assert names(paths) == ["a.jpg", "b.jpg"]
+
+    def test_missing_folder_is_skipped_and_reported(self, tree):
+        missing = str(tree / "Unplugged")
+        paths, unreachable = clip_search.find_images_in(
+            [missing, str(tree / "Scans")], True)
+        assert names(paths) == ["c.png"]
+        assert unreachable == [missing]
+
+    def test_progress_counts_the_folders(self, tree):
+        heard = []
+        clip_search.find_images_in([str(tree / "Photos"), str(tree / "Scans")],
+                                   True, lambda *a: heard.append(a))
+        assert heard == [("Scanning folders", 0, 2), ("Scanning folders", 1, 2)]
 
 
 @pytest.fixture

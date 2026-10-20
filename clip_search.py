@@ -1,7 +1,7 @@
 """
 CLIP Search
 
-Indexes a folder of images with OpenAI's CLIP ViT-B/32 and ranks them
+Indexes one or more folders of images with OpenAI's CLIP ViT-B/32 and ranks them
 against a text prompt, guide images, or both. Both halves of the model run
 through onnxruntime, from the same pinned HuggingFace checkpoint ImageMosaic
 uses, so the image and text embeddings share one space.
@@ -121,6 +121,38 @@ def find_images(folder: str, recursive: bool) -> List[str]:
     return [os.path.join(folder, f) for f in os.listdir(folder)
             if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS
             and os.path.isfile(os.path.join(folder, f))]
+
+
+def find_images_in(folders: List[str], recursive: bool,
+                   progress: Progress = None) -> Tuple[List[str], List[str]]:
+    """The images in several folders, and the folders that could not be read.
+
+    Folders can overlap (one inside another with recursive on) or name the
+    same place spelt differently, so each file is listed once, under the
+    spelling it was first found by. A folder that is missing or unreadable,
+    such as an unplugged drive or an offline share, is skipped rather than
+    failing the search.
+    """
+    paths, seen, unreachable = [], set(), []
+    for i, folder in enumerate(folders):
+        if progress:
+            progress("Scanning folders" if len(folders) > 1 else "Scanning folder",
+                     i, len(folders) if len(folders) > 1 else 0)
+        if not os.path.isdir(folder):
+            unreachable.append(folder)
+            continue
+        try:
+            found = find_images(folder, recursive)
+        except OSError as e:
+            print(f"Skipping {folder}: {e}")
+            unreachable.append(folder)
+            continue
+        for path in found:
+            key = os.path.normcase(os.path.abspath(path))
+            if key not in seen:
+                seen.add(key)
+                paths.append(path)
+    return paths, unreachable
 
 
 def clip_input(image: Image.Image) -> np.ndarray:
