@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox,
                              QScrollArea, QSlider, QSpacerItem, QSpinBox,
                              QStyle, QToolButton, QVBoxLayout, QWidget)
 
+import ai_prompt
 import clip_search
 import describe
 import face_search
@@ -557,11 +558,58 @@ class DescriptionPanel(QWidget):
         announce(self, "Description copied")
 
 
+class PromptPanel(QWidget):
+    """The prompt an AI-generated image was made from, as saved in the file
+    by the program that made it, with what else it saved about how."""
+
+    def __init__(self, found, parent=None):
+        super().__init__(parent)
+        self.found = found
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.text = self.add_text(layout, "Prompt", found.prompt, stretch=2)
+        self.negative = None
+        if found.negative:
+            self.negative = self.add_text(layout, "Negative prompt",
+                                          found.negative, stretch=1)
+        lines = [f"{k}: {v}" for k, v in found.settings]
+        lines.append(f"Made with {found.generator}")
+        self.details = WrapLabel("\n".join(lines))
+        self.details.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        make_secondary(self.details)
+        layout.addWidget(self.details)
+        self.copy_button = QPushButton("Cop&y prompt")
+        self.copy_button.clicked.connect(self.copy)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(self.copy_button)
+        layout.addLayout(buttons)
+
+    @staticmethod
+    def add_text(layout, title, text, stretch):
+        box = QPlainTextEdit(text)
+        box.setReadOnly(True)
+        box.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard)
+        layout.addWidget(heading(title, box))
+        layout.addWidget(box, stretch)
+        return box
+
+    def copy(self):
+        """Copy the prompt alone, which is what gets pasted into a
+        generator; the rest can be selected and copied by hand."""
+        QApplication.clipboard().setText(self.found.prompt)
+        announce(self, "Prompt copied")
+
+
 class ImageDialog(QDialog):
     """One image, scaled to fit the screen, with the matched face boxed.
 
     With descriptions (a DescriptionService), it can also describe the
-    photo, in a panel beside it.
+    photo, in a panel beside it. If the image holds the prompt an AI
+    generator made it from, a Prompt button shows that beside it too.
     """
 
     PANEL_WIDTH_EM = 22
@@ -618,6 +666,25 @@ class ImageDialog(QDialog):
             person_button.clicked.connect(lambda: (self.accept(),
                                                    on_find_person(self.path)))
             buttons.addWidget(person_button)
+        self.side = QWidget()
+        side_layout = QVBoxLayout(self.side)
+        side_layout.setContentsMargins(0, 0, 0, 0)
+        self.side.hide()
+        self.prompt_panel = None
+        found = ai_prompt.find_prompt(path)
+        if found is not None:
+            self.prompt_panel = PromptPanel(found)
+            self.prompt_panel.hide()
+            side_layout.addWidget(self.prompt_panel, 1)
+            self.prompt_button = QPushButton("Pro&mpt")
+            self.prompt_button.setCheckable(True)
+            self.prompt_button.setToolTip(
+                f"Show the prompt {found.generator} made this image from")
+            self.prompt_button.toggled.connect(self.show_prompt)
+            buttons.addWidget(self.prompt_button)
+            self.image.setAccessibleDescription(" ".join(filter(None, (
+                self.image.accessibleDescription(),
+                "Made by AI; the Prompt button shows its prompt"))))
         self.panel = None
         if descriptions is not None:
             self.describe_button = QPushButton("&Describe")
@@ -631,13 +698,13 @@ class ImageDialog(QDialog):
             self.panel = DescriptionPanel()
             self.panel.stop_button.clicked.connect(self.stop_describing)
             self.panel.hide()
+            side_layout.addWidget(self.panel, 1)
         buttons.addWidget(folder_button)
         buttons.addWidget(open_button)
 
         top = QHBoxLayout()
         top.addWidget(self.image, 1)
-        if self.panel is not None:
-            top.addWidget(self.panel)
+        top.addWidget(self.side)
         layout = QVBoxLayout(self)
         layout.addLayout(top, 1)
         layout.addLayout(buttons)
@@ -648,18 +715,34 @@ class ImageDialog(QDialog):
         """Show the description panel and write the photo's description,
         unless one is already being written."""
         if self.panel.isHidden():
+            self.show_beside(self.panel, True)
+        elif not self.panel.stop_button.isHidden():
+            return
+        self.descriptions.start(self.path, self.panel)
+
+    def show_prompt(self, on):
+        self.show_beside(self.prompt_panel, on)
+        if on:
+            self.prompt_panel.text.setFocus()
+
+    def show_beside(self, panel, on):
+        """Show or hide panel beside the photo, shrinking the photo to make
+        room for the side column, or growing it back when that empties."""
+        if on and self.side.isHidden():
             width = self.PANEL_WIDTH_EM * self.fontMetrics().height()
-            self.panel.setFixedWidth(width)
+            self.side.setFixedWidth(width)
             room = QSize(self.max_size[0] - width, self.max_size[1])
             if self.pixmap.width() > room.width():
                 self.image.setPixmap(self.pixmap.scaled(
                     room, Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation))
-            self.panel.show()
-            self.adjustSize()
-        elif not self.panel.stop_button.isHidden():
-            return
-        self.descriptions.start(self.path, self.panel)
+            self.side.show()
+        panel.setVisible(on)
+        if not on and all(p is None or p.isHidden()
+                          for p in (self.prompt_panel, self.panel)):
+            self.side.hide()
+            self.image.setPixmap(self.pixmap)
+        self.adjustSize()
 
     def stop_describing(self):
         self.descriptions.stop(self.panel)

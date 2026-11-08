@@ -94,6 +94,19 @@ sent anywhere. *Copy* puts it on the clipboard.
 recognise individuals: guide photos of a person find similar scenes, clothes
 and poses. Use *Person* for that.
 
+## AI image prompts
+
+Many AI image generators save the prompt in the image file. When an enlarged
+image has one, a *Prompt* button appears; it shows the prompt beside the
+image, along with the negative prompt and whatever settings were saved
+(model, seed, steps...). *Copy prompt* copies the prompt alone.
+
+Prompts are read from AUTOMATIC1111, Forge, SD.Next, ComfyUI, InvokeAI,
+NovelAI, Fooocus, Draw Things and Midjourney images, in PNG, JPEG or WebP.
+ChatGPT/DALL·E and Adobe Firefly do not save the prompt, and most websites
+and chat apps remove it when an image is uploaded, so many AI images have
+none.
+
 ## Keyboard and screen readers
 
 Everything works from the keyboard, and every control has a name a screen

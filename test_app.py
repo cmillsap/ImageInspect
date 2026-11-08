@@ -266,6 +266,39 @@ class TestImageDialog:
         dialog.close()
 
 
+class TestPrompt:
+    @pytest.fixture
+    def ai_image(self, tmp_path):
+        from PIL.PngImagePlugin import PngInfo
+        info = PngInfo()
+        info.add_text("parameters", "a red fox\nNegative prompt: blur\n"
+                      "Steps: 20, Seed: 5, Model: dreamshaper")
+        path = tmp_path / "fox.png"
+        Image.new("RGB", (120, 80)).save(path, pnginfo=info)
+        return str(path)
+
+    def test_no_button_without_a_prompt(self, qapp, photos):
+        assert ImageDialog(photos[1]).prompt_panel is None
+
+    def test_button_shows_and_hides_the_prompt(self, qapp, ai_image,
+                                                announcements):
+        dialog = ImageDialog(ai_image)
+        assert "Prompt button" in dialog.image.accessibleDescription()
+        assert dialog.side.isHidden()
+        dialog.prompt_button.setChecked(True)
+        panel = dialog.prompt_panel
+        assert not dialog.side.isHidden() and not panel.isHidden()
+        assert panel.text.toPlainText() == "a red fox"
+        assert panel.negative.toPlainText() == "blur"
+        assert "Model: dreamshaper" in panel.details.text()
+        panel.copy_button.click()
+        assert QApplication.clipboard().text() == "a red fox"
+        assert ("Prompt copied", False) in announcements
+        dialog.prompt_button.setChecked(False)
+        assert dialog.side.isHidden()
+        dialog.close()
+
+
 # ============================================================================
 # Announcements
 # ============================================================================
