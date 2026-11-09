@@ -176,6 +176,10 @@ the result to `report.txt`; useful as the installed app has no console.
 
 ## How it works
 
+A summary follows; for a guide to the code itself (each module, the data
+flow, caches, threading, tests and packaging), see
+[ARCHITECTURE.md](ARCHITECTURE.md).
+
 - The first search downloads CLIP ViT-B/32 (fp16 ONNX, about 300 MB in total)
   to `%LOCALAPPDATA%\ImageInspect\models`. If ImageMosaic has already
   downloaded its vision model, that copy is reused.
