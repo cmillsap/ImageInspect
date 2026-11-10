@@ -5,7 +5,7 @@ module does, how they fit together, how data flows through a search, and what
 is stored where. The user-facing behaviour is in `README.md`; this document
 explains the code behind it.
 
-Version described: **1.1.0** (`version.py`).
+Version described: **1.1.1** (`version.py`).
 
 ---
 
