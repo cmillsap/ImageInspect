@@ -165,6 +165,39 @@ class TestComfyUI:
                        "inputs": {"positive": ["1", 0], "negative": ["2", 0]}}}
         assert find_prompt(png(tmp_path, [("prompt", json.dumps(graph))])) is None
 
+    def test_switch_preview_and_two_output_encoder(self, tmp_path):
+        # As ComfyUI's Qwen Image 2.1 template saves it: the prompt goes
+        # through a switch and a preview node into an encoder that takes
+        # both prompts, and its node ids are those of a subgraph.
+        graph = {
+            "9:1": {"class_type": "UNETLoader",
+                    "inputs": {"unet_name": "qwen_image.safetensors"}},
+            "9:2": {"class_type": "TextGenerate",
+                    "inputs": {"prompt": "enhance me"}},
+            "9:3": {"class_type": "ComfySwitchNode",
+                    "inputs": {"switch": False, "on_false": "a stern wizard",
+                               "on_true": ["9:2", 0]}},
+            "9:4": {"class_type": "PreviewAny", "inputs": {"source": ["9:3", 0]}},
+            "9:5": {"class_type": "TextEncodeQwenImage21",
+                    "inputs": {"prompt": ["9:4", 0], "negative_prompt": "blurry"}},
+            "9:6": {"class_type": "KSampler",
+                    "inputs": {"model": ["9:1", 0], "positive": ["9:5", 0],
+                               "negative": ["9:5", 1], "seed": 7}},
+        }
+        found = find_prompt(png(tmp_path, [("prompt", json.dumps(graph))]))
+        assert (found.prompt, found.negative) == ("a stern wizard", "blurry")
+        assert dict(found.settings)["Model"] == "qwen_image.safetensors"
+
+        graph["9:3"]["inputs"]["switch"] = True
+        found = find_prompt(png(tmp_path, [("prompt", json.dumps(graph))]))
+        assert found.prompt == "enhance me"
+
+    def test_no_sampler_encoder_with_prompt_input(self, tmp_path):
+        graph = {"1": {"class_type": "TextEncodeQwenImage21",
+                       "inputs": {"prompt": "a lake", "clip": ["2", 0]}}}
+        found = find_prompt(png(tmp_path, [("prompt", json.dumps(graph))]))
+        assert found.prompt == "a lake"
+
     def test_workflow_only(self, tmp_path):
         workflow = {"nodes": [
             {"type": "CLIPTextEncode", "widgets_values": ["a castle"]},

@@ -305,7 +305,7 @@ def from_fooocus_chunk(texts):
 TEXT_INPUTS = ("text", "text_g", "text_l", "prompt", "positive", "string",
                "value", "text_a", "text_b", "conditioning", "conditioning_1",
                "conditioning_2", "conditioning_to", "conditioning_from",
-               "clip_l", "t5xxl")
+               "clip_l", "t5xxl", "source")
 
 
 def from_comfyui(texts):
@@ -348,9 +348,11 @@ def _comfy_api_graph(graph):
         return Prompt("ComfyUI", "\n\n".join(positive), "\n\n".join(negative),
                       settings)
     # No sampler found: whatever text was encoded, in node order.
-    encoded = [n["inputs"]["text"] for n in nodes.values()
+    encoded = [n["inputs"][key] for n in nodes.values()
                if "TextEncode" in str(n.get("class_type", ""))
-               and isinstance(n["inputs"].get("text"), str)]
+               for key in ("text", "prompt")
+               if isinstance(n["inputs"].get(key), str)
+               and n["inputs"][key].strip()]
     return Prompt("ComfyUI", "\n\n".join(encoded)) if encoded else None
 
 
@@ -374,8 +376,24 @@ def _comfy_texts(nodes, link, depth=0, seen=None):
         # positive, 1 the negative.
         return _comfy_texts(nodes, inputs["negative" if link[1] == 1
                                           else "positive"], depth + 1, seen)
+    if "on_true" in inputs or "on_false" in inputs:
+        # A switch passes on one of two inputs. When the choice is itself
+        # wired in, it cannot be known here, so take both.
+        switch = inputs.get("switch")
+        names = (("on_true",) if switch is True else ("on_false",)
+                 if switch is False else ("on_true", "on_false"))
+        return _comfy_inputs(nodes, inputs, names, depth, seen)
+    if "negative_prompt" in inputs and link[1] == 1:
+        # An encoder such as TextEncodeQwenImage21 encodes both prompts:
+        # output 0 is the positive, 1 the negative.
+        return _comfy_inputs(nodes, inputs, ("negative_prompt",), depth, seen)
+    return _comfy_inputs(nodes, inputs, TEXT_INPUTS, depth, seen)
+
+
+def _comfy_inputs(nodes, inputs, names, depth, seen):
+    """The distinct strings given to, or feeding, the named inputs."""
     found = []
-    for name in TEXT_INPUTS:
+    for name in names:
         value = inputs.get(name)
         if isinstance(value, str):
             if value.strip() and value not in found:
