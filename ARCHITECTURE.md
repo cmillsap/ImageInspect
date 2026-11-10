@@ -682,9 +682,15 @@ source.
   `prompt` and a `negative_prompt` (such as *TextEncodeQwenImage21*). A
   switch node (`on_true`/`on_false`) is followed along the branch its
   `switch` value picks, or along both if that value is wired in from
-  another node. The walk is limited to depth 30, with
-  a `seen` set to stop cycles. The model name is found by following the
-  `model` links to a `ckpt_name`, `unet_name` or `model_name`.
+  another node. *StringConcatenate* (`string_a`, `string_b`) gives one
+  string, the two parts joined by its `delimiter`, as ComfyUI encodes it.
+  *ConditioningZeroOut* gives no text, since it empties its conditioning
+  (turbo workflows use it to make the negative from the positive).
+  *PixaromaPrompt* keeps its text under `text` in its `PromptState` JSON. The walk
+  is limited to depth 30, with a `seen` set to stop cycles. The model name
+  is found by following the `model` links to a `ckpt_name`, `unet_name` or
+  `model_name`. A sampler setting wired in from another node (a seed node,
+  say) is read from that node when it holds a plain value (`_comfy_value`).
 - **ComfyUI workflow only** (`_comfy_workflow`): this format has no links to
   follow, so it takes the first `*TextEncode*` node's text as the positive
   prompt and the second as the negative.
@@ -886,7 +892,7 @@ downloads and the describer are replaced with fakes.
 | --- | --- |
 | `test_search.py` | `find_images_in` (several folders, overlap, missing folders, progress); `Index.search` with hand-made unit vectors (text alone, person replacing guides, threshold with text, limit); `FaceIndex` scoring and `best_box`; `person_template`; `_nms`, `align`, `detector_input` geometry. |
 | `test_describe.py` | `FakeOnnxruntime` for the hardware choice (CUDA used or not, quiet fallback detected, retry on CPU, one warning); a fake `urlopen` for downloads (subfolders, combined progress, cancel keeps the part, resume, server that will not resume, corrupt file deleted, present files skipped); `_FILES` complete and pinned for both variants; image preparation; `DescriptionCache`; `describe_file` with a `FakeDescriber` (caching, loading once, cancel not cached, GPU→CPU fallback). |
-| `test_ai_prompt.py` | Builds synthetic PNG/JPEG/WebP files for each generator: A1111/Forge (tEXt, zTXt, iTXt, after IDAT), ComfyUI (graph, precedence over `parameters`, combined conditioning, switch and two-prompt encoder, cycles, workflow only), InvokeAI new and old, NovelAI, Fooocus, Draw Things, Midjourney (description and XMP); camera photos, plain PNGs, damaged files, bad JSON; `as_text`. |
+| `test_ai_prompt.py` | Builds synthetic PNG/JPEG/WebP files for each generator: A1111/Forge (tEXt, zTXt, iTXt, after IDAT), ComfyUI (graph, precedence over `parameters`, combined conditioning, switch and two-prompt encoder, string concatenation, zeroed negative and seed node, PixaromaPrompt, cycles, workflow only), InvokeAI new and old, NovelAI, Fooocus, Draw Things, Midjourney (description and XMP); camera photos, plain PNGs, damaged files, bad JSON; `as_text`. |
 | `test_ui_support.py` | Window rect, scaled fonts, `WidestTextLabel`, `WrapLabel`, `HintLabel`, contrast maths, tone colours in light, dark and high contrast, `StatusLabel`, the announcer hook, and that the UIA path never raises. |
 | `test_app.py` | A real `MainWindow` with temporary `QSettings`, `FakeWorker` and `FakeIndex` to show results without searching. Every input has a distinct accessible name; names follow the mode; result and guide items are spoken in full; tab order matches the screen; shortcuts and tooltips; announcements (nothing at startup, guides, results, cancel, throttled progress); `describe_place`; `FacePickerDialog`; `ImageDialog` description; *Prompt* button. |
 

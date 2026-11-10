@@ -342,8 +342,8 @@ def _comfy_api_graph(graph):
                            ("scheduler", "Scheduler"), ("cfg", "CFG scale"),
                            ("seed", "Seed"), ("noise_seed", "Seed"),
                            ("denoise", "Denoising strength")):
-            value = sampler["inputs"].get(key)
-            if value is not None and not _is_link(value):
+            value = _comfy_value(nodes, sampler["inputs"].get(key), key)
+            if value is not None:
                 settings.append((label, str(value)))
         return Prompt("ComfyUI", "\n\n".join(positive), "\n\n".join(negative),
                       settings)
@@ -354,6 +354,19 @@ def _comfy_api_graph(graph):
                if isinstance(n["inputs"].get(key), str)
                and n["inputs"][key].strip()]
     return Prompt("ComfyUI", "\n\n".join(encoded)) if encoded else None
+
+
+def _comfy_value(nodes, value, key):
+    """A setting given to a node, or held by the node wired in to give it
+    (a seed node, a primitive), if that is a plain value."""
+    if _is_link(value):
+        node = nodes.get(str(value[0]))
+        inputs = node["inputs"] if node is not None else {}
+        value = next((inputs[k] for k in (key, "seed", "value")
+                      if k in inputs and not _is_link(inputs[k])), None)
+    if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+        return value
+    return None
 
 
 def _is_link(value):
@@ -371,11 +384,25 @@ def _comfy_texts(nodes, link, depth=0, seen=None):
         return []
     seen.add(str(link[0]))
     inputs = node["inputs"]
+    if node.get("class_type") == "ConditioningZeroOut":
+        return []      # Empties what it is given: no prompt comes out of it.
+    state = _json(inputs.get("PromptState"))
+    if isinstance(state, dict) and isinstance(state.get("text"), str):
+        # PixaromaPrompt keeps its text in a JSON state.
+        return [state["text"]] if state["text"].strip() else []
     if _is_link(inputs.get("positive")) and _is_link(inputs.get("negative")):
         # A node such as ControlNet apply passes both on: output 0 is the
         # positive, 1 the negative.
         return _comfy_texts(nodes, inputs["negative" if link[1] == 1
                                           else "positive"], depth + 1, seen)
+    if "string_a" in inputs and "string_b" in inputs:
+        # StringConcatenate: one string, the two parts joined by delimiter.
+        delimiter = inputs.get("delimiter")
+        delimiter = delimiter if isinstance(delimiter, str) else ""
+        parts = ["\n\n".join(_comfy_inputs(nodes, inputs, (name,), depth, seen))
+                 for name in ("string_a", "string_b")]
+        joined = delimiter.join(p for p in parts if p)
+        return [joined] if joined else []
     if "on_true" in inputs or "on_false" in inputs:
         # A switch passes on one of two inputs. When the choice is itself
         # wired in, it cannot be known here, so take both.

@@ -192,6 +192,38 @@ class TestComfyUI:
         found = find_prompt(png(tmp_path, [("prompt", json.dumps(graph))]))
         assert found.prompt == "enhance me"
 
+    def test_string_concatenate(self, tmp_path):
+        # A LoRA trigger word put in front of the prompt, as Krea 2 workflows do.
+        graph = comfy_graph()
+        graph["20"] = {"class_type": "StringConcatenate",
+                       "inputs": {"string_a": "jmd", "string_b": ["21", 0],
+                                  "delimiter": ", "}}
+        graph["21"] = {"class_type": "PrimitiveString",
+                       "inputs": {"value": "a red fox"}}
+        found = find_prompt(png(tmp_path, [("prompt", json.dumps(graph))]))
+        assert found.prompt == "jmd, a red fox"
+        assert found.negative == "watermark, text"
+
+    def test_zeroed_negative_and_seed_node(self, tmp_path):
+        # Turbo models at CFG 1 take the positive, zeroed out, as negative.
+        graph = comfy_graph()
+        graph["7"] = {"class_type": "ConditioningZeroOut",
+                      "inputs": {"conditioning": ["6", 0]}}
+        graph["30"] = {"class_type": "PixaromaSeed",
+                       "inputs": {"SeedState": "{}", "seed": 99}}
+        graph["3"]["inputs"]["seed"] = ["30", 0]
+        found = find_prompt(png(tmp_path, [("prompt", json.dumps(graph))]))
+        assert (found.prompt, found.negative) == ("a red fox", "")
+        assert dict(found.settings)["Seed"] == "99"
+
+    def test_pixaroma_prompt(self, tmp_path):
+        graph = comfy_graph()
+        graph["20"] = {"class_type": "PixaromaPrompt", "inputs": {
+            "PromptState": json.dumps({"text": "a coloring page of a fox",
+                                       "order": "mine", "sep": ", "})}}
+        found = find_prompt(png(tmp_path, [("prompt", json.dumps(graph))]))
+        assert found.prompt == "a coloring page of a fox"
+
     def test_no_sampler_encoder_with_prompt_input(self, tmp_path):
         graph = {"1": {"class_type": "TextEncodeQwenImage21",
                        "inputs": {"prompt": "a lake", "clip": ["2", 0]}}}
