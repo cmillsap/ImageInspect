@@ -371,7 +371,7 @@ class FaceIndex:
                 for path, boxes, scores, first, count in found:
                     ok = boxes is not None
                     if not ok:
-                        boxes = np.zeros((0, 4), np.float32)
+                        boxes, scores = np.zeros((0, 4), np.float32), ()
                     vectors = embeddings[first:first + count]
                     self._known[path] = (mtimes[path], ok, boxes, vectors)
                     file_rows.append((path, mtimes[path], int(ok)))

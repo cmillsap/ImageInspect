@@ -128,6 +128,22 @@ class TestFaceIndex:
             pytest.approx([.5, .5, .6, .6])
         assert faces.best_box(unit(0, 1), "empty.jpg") is None
 
+    def test_build_skips_files_that_cannot_be_read(self, tmp_path):
+        class Model:
+            def find_faces(self, image, pixels, scale):
+                return (np.array([[10, 10, 50, 50]], np.float32),
+                        np.array([0.9], np.float32), [None])
+
+            def embed(self, faces):
+                return np.stack([unit(1, 0)] * len(faces))
+
+        good, bad = tmp_path / "good.jpg", tmp_path / "bad.tif"
+        Image.new("RGB", (100, 100)).save(good)
+        bad.write_bytes(b"not an image")
+        idx = face_search.FaceIndex(str(tmp_path / "index.sqlite"))
+        idx.build(Model(), [str(bad), str(good)])
+        assert idx.paths == [str(good)]
+
     def test_template_is_the_normalised_mean(self):
         template = face_search.person_template(np.stack([unit(1, 0), unit(0, 1)]))
         assert template == pytest.approx(unit(1, 1))
